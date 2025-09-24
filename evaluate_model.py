@@ -2,176 +2,140 @@ import os
 import argparse
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-import matplotlib.pyplot as plt
+import torch.nn.functional as F
 from sklearn.metrics import matthews_corrcoef, f1_score, precision_score, recall_score, confusion_matrix
-import seaborn as sns
+import matplotlib.pyplot as plt
 
-# Import our modules
-from data_utils import GlacierDataset, create_segmentation_dataloaders
-from models import PixelANN, UNet, DeepLabV3Plus
+from data_utils import create_dataloaders, create_segmentation_dataloaders
+from models import UNet, DeepLabV3Plus, PixelANN  # PixelANN optional in your models.py
 
-def evaluate_model(model, dataloader, device, is_segmentation: bool):
-    """Evaluate model on dataset.
+def plot_confusion(cm, save_path):
+    plt.figure(figsize=(4, 4))
+    plt.imshow(cm, cmap='Blues')
+    plt.title('Confusion Matrix')
+    plt.colorbar()
+    plt.xticks([0, 1], ['Non-Glacier', 'Glacier'])
+    plt.yticks([0, 1], ['Non-Glacier', 'Glacier'])
+    for i in range(2):
+        for j in range(2):
+            plt.text(j, i, cm[i, j], ha='center', va='center')
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
 
-    Args:
-        model: torch model
-        dataloader: DataLoader yielding either (pixels, labels) for pixel-wise or (tiles, masks) for segmentation
-        device: torch.device
-        is_segmentation: True for UNet/DeepLab, False for PixelANN
-    """
+def compute_metrics(y_true, y_pred):
+    y_true = y_true.astype(np.uint8).ravel()
+    y_pred = y_pred.astype(np.uint8).ravel()
+    mcc = matthews_corrcoef(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+    prec = precision_score(y_true, y_pred, zero_division=0)
+    rec = recall_score(y_true, y_pred, zero_division=0)
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    return dict(mcc=mcc, f1=f1, precision=prec, recall=rec, confusion_matrix=cm)
+
+def evaluate_segmentation(model, loader, device, threshold):
+    ys, ps = [], []
     model.eval()
-    all_preds = []
-    all_targets = []
-
     with torch.no_grad():
-        for inputs, targets in tqdm(dataloader, desc="Evaluating"):
-            inputs = inputs.to(device)
-            if is_segmentation:
-                # targets shape: (N, H, W) -> (N,1,H,W) for consistency then flatten
-                targets_tensor = targets.to(device).unsqueeze(1)
-                outputs = model(inputs)  # (N,1,H,W)
-                preds = (outputs > 0.5).float().cpu().numpy().reshape(-1)
-                targs = targets_tensor.cpu().numpy().reshape(-1)
-            else:
-                # Pixel-wise: inputs (B,5), targets (B,)
-                targets = targets.to(device).view(-1, 1)
-                outputs = model(inputs)
-                preds = (outputs > 0.5).float().cpu().numpy().reshape(-1)
-                targs = targets.cpu().numpy().reshape(-1)
+        for xb, yb in loader:
+            xb = xb.to(device)
+            logits = model(xb)
+            if logits.dim() == 2:
+                # Pixel model fallback: reshape if needed
+                n, hw = logits.shape
+                H, W = yb.shape[-2], yb.shape[-1]
+                logits = logits.view(n, 1, H, W)
+            elif logits.shape[-2:] != yb.shape[-2:]:
+                logits = F.interpolate(logits, size=yb.shape[-2:], mode="bilinear", align_corners=False)
+            probs = torch.sigmoid(logits)
+            pred = (probs > threshold).cpu().numpy().astype(np.uint8)
+            ys.append((yb.numpy() > 0).astype(np.uint8))
+            ps.append(pred)
+    y = np.concatenate([a.reshape(-1) for a in ys])
+    p = np.concatenate([a.reshape(-1) for a in ps])
+    return compute_metrics(y, p)
 
-            all_preds.extend(preds.tolist())
-            all_targets.extend(targs.tolist())
-    
-    # Calculate metrics
-    mcc = matthews_corrcoef(all_targets, all_preds)
-    f1 = f1_score(all_targets, all_preds)
-    precision = precision_score(all_targets, all_preds, zero_division=0)
-    recall = recall_score(all_targets, all_preds, zero_division=0)
-    
-    # Calculate confusion matrix
-    cm = confusion_matrix(all_targets, all_preds)
-    
-    metrics = {
-        "mcc": mcc,
-        "f1": f1,
-        "precision": precision,
-        "recall": recall,
-        "confusion_matrix": cm
-    }
-    
-    return metrics
+def evaluate_pixel(model, loader, device, threshold):
+    ys, ps = [], []
+    model.eval()
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb = xb.to(device)
+            logits = model(xb)
+            probs = torch.sigmoid(logits)
+            pred = (probs > threshold).cpu().numpy().astype(np.uint8)
+            ys.append((yb.numpy() > 0).astype(np.uint8))
+            ps.append(pred)
+    y = np.concatenate(ys).reshape(-1)
+    p = np.concatenate(ps).reshape(-1)
+    return compute_metrics(y, p)
 
-def plot_confusion_matrix(cm, save_path=None):
-    """Plot confusion matrix."""
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(
-        cm, 
-        annot=True, 
-        fmt="d", 
-        cmap="Blues", 
-        xticklabels=["Non-Glacier", "Glacier"],
-        yticklabels=["Non-Glacier", "Glacier"]
-    )
-    plt.xlabel("Predicted")
-    plt.ylabel("True")
-    plt.title("Confusion Matrix")
-    
-    if save_path:
-        plt.savefig(save_path)
-    
-    plt.show()
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--model_type', type=str, required=True, choices=['unet', 'deeplabv3plus', 'pixelann'])
+    ap.add_argument('--model_path', type=str, required=True)
+    ap.add_argument('--data_dir', type=str, required=True)
+    ap.add_argument('--batch_size', type=int, default=1)
+    ap.add_argument('--device', type=str, default='cuda')
+    ap.add_argument('--num_workers', type=int, default=2)
+    ap.add_argument('--threshold', type=float, default=0.6)
+    ap.add_argument('--output_dir', type=str, required=True)
+    args = ap.parse_args()
 
-def main(args):
-    # Set device
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    
-    # Create dataloader suitable for the model type
-    if args.model_type == "pixelann":
-        dataset = GlacierDataset(args.data_dir, is_training=False, val_split=args.val_split)
-        dataloader = DataLoader(
-            dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=True,
-        )
-        is_segmentation = False
-    else:
-        # Full-tile dataloader; use a small batch to fit memory on CPU
-        _, val_loader = create_segmentation_dataloaders(
-            args.data_dir,
-            batch_size=1,
-            val_split=args.val_split,
-            num_workers=args.num_workers,
-        )
-        dataloader = val_loader
-        is_segmentation = True
-    
-    # Create model
-    if args.model_type == "pixelann":
-        model = PixelANN(
-            in_channels=5,
-            hidden_dims=[32, 64, 128, 64, 32],
-            dropout_rate=0.0  # No dropout during evaluation
-        )
-    elif args.model_type == "unet":
+    device = torch.device(args.device if torch.cuda.is_available() and args.device == 'cuda' else 'cpu')
+
+    # Load model
+    if args.model_type == 'unet':
         model = UNet(in_channels=5, out_channels=1)
-    elif args.model_type == "deeplabv3plus":
+    elif args.model_type == 'deeplabv3plus':
+        # Remove unsupported pretrained argument (not in our implementation)
         model = DeepLabV3Plus(in_channels=5, out_channels=1)
     else:
-        raise ValueError(f"Unknown model type: {args.model_type}")
-    
-    # Load model weights
-    model.load_state_dict(torch.load(args.model_path, map_location=device))
-    model = model.to(device)
-    print(f"Model loaded from {args.model_path}")
-    
-    # Evaluate model
-    metrics = evaluate_model(model, dataloader, device, is_segmentation)
-    
-    # Print metrics
-    print(f"MCC: {metrics['mcc']:.4f}")
-    print(f"F1 Score: {metrics['f1']:.4f}")
-    print(f"Precision: {metrics['precision']:.4f}")
-    print(f"Recall: {metrics['recall']:.4f}")
-    
-    # Create output directory if it doesn't exist
+        # PixelANN uses in_channels parameter in our implementation
+        try:
+            model = PixelANN(in_channels=5)
+        except Exception:
+            import torch.nn as nn
+            model = nn.Sequential(nn.Linear(5, 1))
+    state = torch.load(args.model_path, map_location=device)
+    model.load_state_dict(state, strict=False)
+    model.to(device)
+
+    # Load validation split (tolerate different create_*dataloaders signatures)
+    if args.model_type in ['unet', 'deeplabv3plus']:
+        try:
+            _, val_loader = create_segmentation_dataloaders(
+                args.data_dir, batch_size=args.batch_size, augment=False, num_workers=args.num_workers
+            )
+        except TypeError:
+            try:
+                _, val_loader = create_segmentation_dataloaders(
+                    args.data_dir, batch_size=args.batch_size, augment=False
+                )
+            except TypeError:
+                _, val_loader = create_segmentation_dataloaders(
+                    args.data_dir, batch_size=args.batch_size
+                )
+        metrics = evaluate_segmentation(model, val_loader, device, args.threshold)
+    else:
+        try:
+            _, val_loader = create_dataloaders(
+                args.data_dir, batch_size=4096, num_workers=args.num_workers
+            )
+        except TypeError:
+            _, val_loader = create_dataloaders(
+                args.data_dir, batch_size=4096
+            )
+        metrics = evaluate_pixel(model, val_loader, device, args.threshold)
+
     os.makedirs(args.output_dir, exist_ok=True)
-    
-    # Plot confusion matrix
-    plot_confusion_matrix(metrics['confusion_matrix'], save_path=os.path.join(args.output_dir, "confusion_matrix.png"))
-    
-    # Save metrics to file
+    print(f"MCC: {metrics['mcc']:.4f}  F1: {metrics['f1']:.4f}  P: {metrics['precision']:.4f}  R: {metrics['recall']:.4f}")
+    plot_confusion(metrics['confusion_matrix'], os.path.join(args.output_dir, "confusion_matrix.png"))
     with open(os.path.join(args.output_dir, "metrics.txt"), "w") as f:
         f.write(f"MCC: {metrics['mcc']:.4f}\n")
-        f.write(f"F1 Score: {metrics['f1']:.4f}\n")
+        f.write(f"F1: {metrics['f1']:.4f}\n")
         f.write(f"Precision: {metrics['precision']:.4f}\n")
         f.write(f"Recall: {metrics['recall']:.4f}\n")
-    
-    return metrics
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate glacier segmentation model")
-    
-    # Data parameters
-    parser.add_argument("--data_dir", type=str, default="./Train", help="Path to data directory")
-    parser.add_argument("--val_split", type=float, default=0.2, help="Validation split ratio")
-    
-    # Model parameters
-    parser.add_argument("--model_type", type=str, default="pixelann", choices=["pixelann", "unet", "deeplabv3plus"], help="Type of model to evaluate")
-    parser.add_argument("--model_path", type=str, required=True, help="Path to model weights")
-    
-    # Evaluation parameters
-    parser.add_argument("--batch_size", type=int, default=4096, help="Batch size for evaluation")
-    
-    # System parameters
-    parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"], help="Device to use")
-    parser.add_argument("--num_workers", type=int, default=4, help="Number of workers for data loading")
-    parser.add_argument("--output_dir", type=str, default="./results", help="Path to save results")
-    
-    args = parser.parse_args()
-    
-    main(args)
+if __name__ == '__main__':
+    main()

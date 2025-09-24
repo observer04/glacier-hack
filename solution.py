@@ -198,7 +198,14 @@ def normalize_band(band_data):
         return (band_data - mean) / std
     return band_data
 
-def maskgeration(imagepath, out_dir):
+def _get_threshold():
+    # Allow env override; default to tuned 0.60
+    try:
+        return float(os.environ.get("SOLUTION_THRESHOLD", "0.6"))
+    except Exception:
+        return 0.6
+
+def maskgeration(imagepath: dict, out_dir: str):
     """Generate binary masks for glacier segmentation.
     
     Args:
@@ -211,10 +218,7 @@ def maskgeration(imagepath, out_dir):
     # Config: allow model path/type/threshold via environment
     model_path = os.getenv("SOLUTION_MODEL_PATH", "model.pth")
     model_pref = os.getenv("SOLUTION_MODEL_TYPE", "auto").lower()  # auto|unet|deeplabv3plus|pixelann
-    try:
-        threshold = float(os.getenv("SOLUTION_THRESHOLD", "0.5"))
-    except Exception:
-        threshold = 0.5
+    threshold = _get_threshold()
 
     def _try_load(model_ctor, label: str):
         m = model_ctor()
@@ -366,7 +370,7 @@ def maskgeration(imagepath, out_dir):
         
         # Save the mask
         output_path = os.path.join(out_dir, f"{tile_id}.tif")
-        Image.fromarray(full_mask).save(output_path)
+    Image.fromarray(full_mask).save(output_path)
 
 # The main function will be provided by the evaluation system
 def main():

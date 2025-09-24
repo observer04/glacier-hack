@@ -9,6 +9,30 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from sklearn.metrics import matthews_corrcoef, f1_score, precision_score, recall_score
 
+# Utility: compute validation probabilities for threshold sweep
+def collect_validation_probs(model, dataloader, device):
+    model.eval()
+    probs_list = []
+    targets_list = []
+    with torch.no_grad():
+        for inputs, targets in dataloader:
+            inputs = inputs.to(device)
+            targets_list.append(targets.view(-1).cpu().numpy()) if targets.dim()==1 else targets_list.append(targets.cpu().numpy().reshape(-1))
+            outputs = model(inputs)
+            # Ensure probability space
+            probs = outputs
+            if probs.dim() == 4:  # (N,1,H,W)
+                probs = probs.reshape(-1)
+            elif probs.dim() == 2:
+                probs = probs.view(-1)
+            else:
+                probs = probs.view(-1)
+            probs_list.append(probs.detach().cpu().numpy())
+    import numpy as np
+    y = np.concatenate(targets_list)
+    p = np.concatenate(probs_list)
+    return y, p
+
 class MCC(nn.Module):
     """Matthews Correlation Coefficient loss function."""
     
@@ -233,7 +257,9 @@ def validate(model, dataloader, criterion, device):
 def train_model(model, train_loader, val_loader, criterion, optimizer, 
                scheduler=None, num_epochs=50, device="cuda", 
                model_save_path="models", early_stopping_patience=10,
-               accum_steps: int = 1, grad_clip: float = 0.0):
+               accum_steps: int = 1, grad_clip: float = 0.0,
+               use_amp: bool = False, use_swa: bool = False,
+               checkpoint_interval: int = 0):
     """Train model with validation and early stopping."""
     # Create directory for saving models if it doesn't exist
     os.makedirs(model_save_path, exist_ok=True)
@@ -255,14 +281,73 @@ def train_model(model, train_loader, val_loader, criterion, optimizer,
         "train_recall": [], "val_recall": []
     }
     
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    swa_model = None
+    if use_swa:
+        from torch.optim.swa_utils import AveragedModel
+        swa_model = AveragedModel(model)
+
     for epoch in range(num_epochs):
         print(f"\nEpoch {epoch+1}/{num_epochs}")
         start_time = time.time()
         
         # Train epoch
-        train_loss, train_mcc, train_f1, train_precision, train_recall = train_epoch(
-            model, train_loader, criterion, optimizer, device, accum_steps=accum_steps, grad_clip=grad_clip
-        )
+        if use_amp:
+            # Wrap train_epoch manually for amp
+            model.train()
+            running_loss = 0.0
+            all_preds = []
+            all_targets = []
+            optimizer.zero_grad()
+            for step, (inputs, targets) in enumerate(tqdm(train_loader, desc="Training")):
+                inputs = inputs.to(device)
+                if targets.dim() == 1:
+                    targets_t = targets.view(-1, 1).to(device)
+                elif targets.dim() == 2:
+                    targets_t = targets.unsqueeze(1).to(device)
+                else:
+                    targets_t = targets.to(device)
+                with torch.cuda.amp.autocast():
+                    outputs = model(inputs)
+                    if outputs.dim() == 4 and targets_t.dim() == 3:
+                        loss = criterion(outputs, targets_t.unsqueeze(1))
+                    elif outputs.dim() == 4 and targets_t.dim() == 4:
+                        loss = criterion(outputs, targets_t)
+                    else:
+                        loss = criterion(outputs, targets_t)
+                if accum_steps > 1:
+                    scaler.scale(loss / accum_steps).backward()
+                    do_step = ((step + 1) % accum_steps == 0) or (step + 1 == len(train_loader))
+                    if do_step:
+                        if grad_clip and grad_clip > 0.0:
+                            scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad()
+                else:
+                    scaler.scale(loss).backward()
+                    if grad_clip and grad_clip > 0.0:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                running_loss += loss.item() * inputs.size(0)
+                preds_np = (outputs > 0.5).float().detach().cpu().numpy().reshape(-1)
+                targs_np = targets_t.float().cpu().numpy().reshape(-1)
+                all_preds.extend(preds_np)
+                all_targets.extend(targs_np)
+            train_loss = running_loss / len(train_loader.dataset)
+            from sklearn.metrics import matthews_corrcoef, f1_score, precision_score, recall_score
+            train_mcc = matthews_corrcoef(all_targets, all_preds)
+            train_f1 = f1_score(all_targets, all_preds)
+            train_precision = precision_score(all_targets, all_preds, zero_division=0)
+            train_recall = recall_score(all_targets, all_preds, zero_division=0)
+        else:
+            train_loss, train_mcc, train_f1, train_precision, train_recall = train_epoch(
+                model, train_loader, criterion, optimizer, device, accum_steps=accum_steps, grad_clip=grad_clip
+            )
         
         # Validate epoch
         val_loss, val_mcc, val_f1, val_precision, val_recall = validate(
@@ -303,14 +388,39 @@ def train_model(model, train_loader, val_loader, criterion, optimizer,
         else:
             no_improve_epochs += 1
             print(f"No improvement for {no_improve_epochs} epochs")
+
+        # SWA update (after certain epoch maybe half training) - simple every epoch after improvement window
+        if use_swa and swa_model is not None:
+            swa_model.update_parameters(model)
+
+        # Checkpoint interval
+        if checkpoint_interval and (epoch + 1) % checkpoint_interval == 0:
+            ckpt_path = os.path.join(model_save_path, f"checkpoint_epoch{epoch+1}.pth")
+            torch.save({
+                'epoch': epoch+1,
+                'model_state': model.state_dict(),
+                'optimizer_state': optimizer.state_dict(),
+                'best_mcc': best_mcc
+            }, ckpt_path)
+            print(f"Saved checkpoint: {ckpt_path}")
         
         # Early stopping
         if no_improve_epochs >= early_stopping_patience:
             print(f"Early stopping after {epoch+1} epochs")
             break
     
-    # Load best model
-    model.load_state_dict(torch.load(best_model_path))
+    # Apply SWA bn update & load best or swa weights
+    if use_swa and swa_model is not None:
+        try:
+            from torch.optim.swa_utils import update_bn
+            update_bn(train_loader, swa_model, device=torch.device(device))
+            model.load_state_dict(swa_model.state_dict())
+            print("Loaded SWA averaged weights")
+        except Exception as e:
+            print(f"SWA update failed: {e}, falling back to best model")
+            model.load_state_dict(torch.load(best_model_path))
+    else:
+        model.load_state_dict(torch.load(best_model_path))
     
     # Plot training curves
     plot_training_curves(history, os.path.join(model_save_path, "training_curves.png"))
