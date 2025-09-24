@@ -1,6 +1,7 @@
 import os
 import argparse
 import numpy as np
+import shutil
 import torch
 import tempfile
 from tqdm import tqdm
@@ -11,12 +12,39 @@ from sklearn.metrics import matthews_corrcoef
 # Import solution
 from solution import maskgeration
 
+def _find_label_path(label_dir: str, tile_id: str):
+    candidates = [
+        os.path.join(label_dir, f"Y{tile_id}.tif"),
+        os.path.join(label_dir, f"Y_output_resized_{tile_id}.tif"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
+
 def test_solution(data_dir, output_dir):
     """Test solution on sample data."""
     print("Testing solution.py on sample data...")
     
     # Create temporary directory for outputs
     with tempfile.TemporaryDirectory() as temp_dir:
+        # Ensure a model.pth exists for solution.py to load
+        model_needed = not os.path.exists("model.pth")
+        tmp_model_copied = False
+        if model_needed:
+            candidate_models = [
+                os.path.join("./models", "pixelann_baseline", "model.pth"),
+                os.path.join("./models", "model.pth"),
+                os.path.join("./models", "best_model.pth"),
+            ]
+            for src in candidate_models:
+                if os.path.exists(src):
+                    shutil.copy(src, "model.pth")
+                    tmp_model_copied = True
+                    print(f"Using model weights from {src}")
+                    break
+            if not tmp_model_copied:
+                print("Warning: No model.pth found and no candidate model to copy. maskgeration may fail.")
         # Prepare input structure
         imagepath = {
             f"Band{i}": os.path.join(data_dir, f"Band{i}") for i in range(1, 6)
@@ -24,6 +52,13 @@ def test_solution(data_dir, output_dir):
         
         # Generate masks
         maskgeration(imagepath, temp_dir)
+
+        # Clean up temporary model if we created one
+        if tmp_model_copied and os.path.exists("model.pth"):
+            try:
+                os.remove("model.pth")
+            except OSError:
+                pass
         
         # Check if masks were generated
         masks = [f for f in os.listdir(temp_dir) if f.endswith(".tif")]
@@ -54,8 +89,8 @@ def test_solution(data_dir, output_dir):
             pred = (pred > 0).astype(np.uint8)
             
             # Load ground truth mask
-            gt_path = os.path.join(label_dir, f"Y{tile_id}.tif")
-            if not os.path.exists(gt_path):
+            gt_path = _find_label_path(label_dir, tile_id)
+            if gt_path is None or not os.path.exists(gt_path):
                 continue
                 
             gt = np.array(Image.open(gt_path))

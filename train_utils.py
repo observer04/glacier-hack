@@ -87,74 +87,114 @@ class CombinedLoss(nn.Module):
     def forward(self, y_pred, y_true):
         return self.alpha * self.bce(y_pred, y_true) + self.beta * self.dice(y_pred, y_true)
 
+def _compute_metrics_from_logits(outputs, targets):
+    # outputs and targets can be (N,1) or (N,1,H,W) or (N,H,W)
+    with torch.no_grad():
+        if outputs.dim() == 4:  # (N,1,H,W)
+            preds = (outputs > 0.5).float().cpu().numpy().reshape(-1)
+            targs = targets.float().cpu().numpy().reshape(-1)
+        elif outputs.dim() == 3:  # (N,H,W)
+            preds = (outputs > 0.5).float().cpu().numpy().reshape(-1)
+            targs = targets.float().cpu().numpy().reshape(-1)
+        else:  # (N,1)
+            preds = (outputs > 0.5).float().cpu().numpy().reshape(-1)
+            targs = targets.float().cpu().numpy().reshape(-1)
+    mcc = matthews_corrcoef(targs, preds)
+    f1 = f1_score(targs, preds)
+    precision = precision_score(targs, preds, zero_division=0)
+    recall = recall_score(targs, preds, zero_division=0)
+    return mcc, f1, precision, recall
+
+
 def train_epoch(model, dataloader, criterion, optimizer, device):
-    """Train model for one epoch."""
+    """Train model for one epoch (supports pixel-wise and tile-wise)."""
     model.train()
     running_loss = 0.0
     all_preds = []
     all_targets = []
-    
+
     for inputs, targets in tqdm(dataloader, desc="Training"):
         inputs = inputs.to(device)
-        targets = targets.to(device).view(-1, 1)
-        
-        # Zero gradients
+        # Targets: pixel (N,) or (N,1) vs tile (N,H,W)
+        # Normalize shapes for loss
+        if targets.dim() == 1:
+            targets_t = targets.view(-1, 1).to(device)
+        elif targets.dim() == 2:
+            targets_t = targets.unsqueeze(1).to(device)  # (N,1,H,W) later
+        else:
+            targets_t = targets.to(device)
+
         optimizer.zero_grad()
-        
-        # Forward pass
+
         outputs = model(inputs)
-        loss = criterion(outputs, targets)
-        
-        # Backward pass and optimize
+
+        # Ensure output shape matches targets for segmentation
+        if outputs.dim() == 4 and targets_t.dim() == 3:
+            # outputs: (N,1,H,W), targets_t: (N,H,W)
+            loss = criterion(outputs, targets_t.unsqueeze(1))
+        elif outputs.dim() == 4 and targets_t.dim() == 4:
+            loss = criterion(outputs, targets_t)
+        else:
+            loss = criterion(outputs, targets_t)
+
         loss.backward()
         optimizer.step()
-        
-        # Track metrics
+
         running_loss += loss.item() * inputs.size(0)
-        
-        # Store predictions and targets for metrics
-        preds = (outputs > 0.5).float().cpu().numpy()
-        all_preds.extend(preds.flatten())
-        all_targets.extend(targets.cpu().numpy().flatten())
-    
-    # Calculate metrics
+
+        # Metrics accumulation
+        if outputs.dim() == 4:
+            preds_np = (outputs > 0.5).float().cpu().numpy().reshape(-1)
+            targs_np = targets_t.float().cpu().numpy().reshape(-1)
+        else:
+            preds_np = (outputs > 0.5).float().cpu().numpy().reshape(-1)
+            targs_np = targets_t.float().cpu().numpy().reshape(-1)
+        all_preds.extend(preds_np)
+        all_targets.extend(targs_np)
+
     mcc = matthews_corrcoef(all_targets, all_preds)
     f1 = f1_score(all_targets, all_preds)
     precision = precision_score(all_targets, all_preds, zero_division=0)
     recall = recall_score(all_targets, all_preds, zero_division=0)
-    
     return running_loss / len(dataloader.dataset), mcc, f1, precision, recall
 
 def validate(model, dataloader, criterion, device):
-    """Validate model on validation set."""
+    """Validate model on validation set (supports pixel-wise and tile-wise)."""
     model.eval()
     running_loss = 0.0
     all_preds = []
     all_targets = []
-    
+
     with torch.no_grad():
         for inputs, targets in tqdm(dataloader, desc="Validation"):
             inputs = inputs.to(device)
-            targets = targets.to(device).view(-1, 1)
-            
-            # Forward pass
+            if targets.dim() == 1:
+                targets_t = targets.view(-1, 1).to(device)
+            elif targets.dim() == 2:
+                targets_t = targets.unsqueeze(1).to(device)
+            else:
+                targets_t = targets.to(device)
+
             outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            
-            # Track metrics
+
+            if outputs.dim() == 4 and targets_t.dim() == 3:
+                loss = criterion(outputs, targets_t.unsqueeze(1))
+            elif outputs.dim() == 4 and targets_t.dim() == 4:
+                loss = criterion(outputs, targets_t)
+            else:
+                loss = criterion(outputs, targets_t)
+
             running_loss += loss.item() * inputs.size(0)
-            
-            # Store predictions and targets for metrics
-            preds = (outputs > 0.5).float().cpu().numpy()
-            all_preds.extend(preds.flatten())
-            all_targets.extend(targets.cpu().numpy().flatten())
-    
-    # Calculate metrics
+
+            preds_np = (outputs > 0.5).float().cpu().numpy().reshape(-1)
+            targs_np = targets_t.float().cpu().numpy().reshape(-1)
+            all_preds.extend(preds_np)
+            all_targets.extend(targs_np)
+
     mcc = matthews_corrcoef(all_targets, all_preds)
     f1 = f1_score(all_targets, all_preds)
     precision = precision_score(all_targets, all_preds, zero_division=0)
     recall = recall_score(all_targets, all_preds, zero_division=0)
-    
     return running_loss / len(dataloader.dataset), mcc, f1, precision, recall
 
 def train_model(model, train_loader, val_loader, criterion, optimizer, 

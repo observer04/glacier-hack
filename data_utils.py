@@ -7,6 +7,22 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 import glob
 
+def _find_label_path(label_dir: str, tile_id: str):
+    """Return the first existing label path for a tile id among known patterns.
+
+    Supports both:
+    - Y{tile_id}.tif
+    - Y_output_resized_{tile_id}.tif
+    """
+    candidates = [
+        os.path.join(label_dir, f"Y{tile_id}.tif"),
+        os.path.join(label_dir, f"Y_output_resized_{tile_id}.tif"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
+
 def get_tile_id(filename):
     """Extract tile ID from filename."""
     match = re.search(r"img(\d+)\.tif", filename)
@@ -66,7 +82,7 @@ class GlacierDataset(Dataset):
             # Check if all bands have this tile
             all_bands_have_tile = all(tile_id in self.band_tile_map[band_idx] for band_idx in range(len(self.band_dirs)))
             # Check if label exists for this tile
-            label_exists = os.path.exists(os.path.join(self.label_dir, f"Y{tile_id}.tif"))
+            label_exists = _find_label_path(self.label_dir, tile_id) is not None
             
             if all_bands_have_tile and label_exists:
                 self.valid_tile_ids.append(tile_id)
@@ -105,8 +121,11 @@ class GlacierDataset(Dataset):
             # Stack bands to form a 5-channel image
             bands_stacked = np.stack(band_arrays, axis=0)  # (5, H, W)
             
-            # Load label
-            label_path = os.path.join(self.label_dir, f"Y{tile_id}.tif")
+            # Load label (support multiple naming patterns)
+            label_path = _find_label_path(self.label_dir, tile_id)
+            if label_path is None:
+                # Skip if label missing (should be rare after valid_tile_ids filtering)
+                continue
             label = np.array(Image.open(label_path))
             label = (label > 0).astype(np.float32)
             
@@ -157,4 +176,107 @@ def create_dataloaders(data_dir, batch_size=4096, val_split=0.2, num_workers=4):
         pin_memory=True
     )
     
+    return train_loader, val_loader
+
+
+class GlacierTileDataset(Dataset):
+    """Dataset that returns full 5-band tiles and masks for segmentation models.
+
+    Returns:
+      - X: FloatTensor of shape (5, H, W)
+      - y: FloatTensor of shape (H, W) with values {0,1}
+    """
+
+    def __init__(self, data_dir, is_training=True, val_split=0.2, random_state=42):
+        super().__init__()
+        self.data_dir = data_dir
+        self.is_training = is_training
+
+        # Band dirs
+        self.band_dirs = []
+        for i in range(1, 6):
+            band_dir = os.path.join(data_dir, f"Band{i}")
+            if not os.path.exists(band_dir):
+                raise ValueError(f"Band{i} directory not found in {data_dir}")
+            self.band_dirs.append(band_dir)
+
+        # Label dir
+        self.label_dir = os.path.join(data_dir, "label")
+        if not os.path.exists(self.label_dir):
+            raise ValueError(f"Label directory not found in {data_dir}")
+
+        # Map band -> tile_id -> filename
+        self.band_tile_map = {i: {} for i in range(5)}
+        all_ids = set()
+        for band_idx, band_dir in enumerate(self.band_dirs):
+            for f in os.listdir(band_dir):
+                if not f.endswith(".tif"):
+                    continue
+                tile_id = get_tile_id(f)
+                if tile_id:
+                    self.band_tile_map[band_idx][tile_id] = f
+                    all_ids.add(tile_id)
+
+        # Keep only tiles present in all bands with a matching label file
+        self.valid_tile_ids = []
+        for tid in all_ids:
+            all_bands = all(tid in self.band_tile_map[b] for b in range(5))
+            label_exists = _find_label_path(self.label_dir, tid) is not None
+            if all_bands and label_exists:
+                self.valid_tile_ids.append(tid)
+
+        train_ids, val_ids = train_test_split(self.valid_tile_ids, test_size=val_split, random_state=random_state)
+        self.tile_ids = train_ids if is_training else val_ids
+        print(f"{'Training' if is_training else 'Validation'} tile dataset with {len(self.tile_ids)} tiles")
+
+    def __len__(self):
+        return len(self.tile_ids)
+
+    def __getitem__(self, index: int):
+        tid = self.tile_ids[index]
+        bands = []
+        H = W = None
+        for b in range(5):
+            fp = os.path.join(self.band_dirs[b], self.band_tile_map[b][tid])
+            arr = np.array(Image.open(fp))
+            if arr.ndim == 3:
+                arr = arr[..., 0]
+            H, W = arr.shape
+            arr = normalize_band(arr)
+            bands.append(arr)
+
+        x = np.stack(bands, axis=0).astype(np.float32)  # (5, H, W)
+
+        label_path = _find_label_path(self.label_dir, tid)
+        if label_path is None:
+            raise FileNotFoundError(f"Label not found for tile {tid} in {self.label_dir}")
+        y = np.array(Image.open(label_path))
+        if y.ndim == 3:
+            y = y[..., 0]
+        y = (y > 0).astype(np.float32)  # (H, W)
+
+        return torch.from_numpy(x), torch.from_numpy(y)
+
+
+def create_segmentation_dataloaders(data_dir, batch_size=2, val_split=0.2, num_workers=2):
+    """Create dataloaders for segmentation models operating on full tiles."""
+    train_dataset = GlacierTileDataset(data_dir, is_training=True, val_split=val_split)
+    val_dataset = GlacierTileDataset(data_dir, is_training=False, val_split=val_split)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
     return train_loader, val_loader

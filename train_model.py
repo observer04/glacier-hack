@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 # Import our modules
-from data_utils import create_dataloaders
+from data_utils import create_dataloaders, create_segmentation_dataloaders
 from models import PixelANN, UNet, DeepLabV3Plus
 from train_utils import train_model, CombinedLoss, FocalLoss, DiceLoss
 
@@ -14,13 +14,23 @@ def main(args):
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Create dataloaders
-    train_loader, val_loader = create_dataloaders(
-        args.data_dir, 
-        batch_size=args.batch_size,
-        val_split=args.val_split,
-        num_workers=args.num_workers
-    )
+    # Create dataloaders: pixel-wise for PixelANN, tile-wise for UNet/DeepLab
+    if args.model_type == "pixelann":
+        train_loader, val_loader = create_dataloaders(
+            args.data_dir,
+            batch_size=args.batch_size,
+            val_split=args.val_split,
+            num_workers=args.num_workers,
+        )
+    else:
+        # For segmentation models, batch size is per tile; default smaller
+        seg_batch = max(1, min(args.batch_size, 4))  # keep small to avoid OOM
+        train_loader, val_loader = create_segmentation_dataloaders(
+            args.data_dir,
+            batch_size=seg_batch,
+            val_split=args.val_split,
+            num_workers=args.num_workers,
+        )
     
     # Create model
     if args.model_type == "pixelann":
@@ -39,16 +49,20 @@ def main(args):
     print(f"Model created: {args.model_type}")
     
     # Define loss function
-    if args.loss == "bce":
-        criterion = nn.BCELoss()
-    elif args.loss == "focal":
-        criterion = FocalLoss(alpha=0.25, gamma=2.0)
-    elif args.loss == "dice":
-        criterion = DiceLoss()
-    elif args.loss == "combined":
-        criterion = CombinedLoss(alpha=0.5, beta=0.5)
+    if args.model_type == "pixelann":
+        if args.loss == "bce":
+            criterion = nn.BCELoss()
+        elif args.loss == "focal":
+            criterion = FocalLoss(alpha=0.25, gamma=2.0)
+        elif args.loss == "dice":
+            criterion = DiceLoss()
+        elif args.loss == "combined":
+            criterion = CombinedLoss(alpha=0.5, beta=0.5)
+        else:
+            raise ValueError(f"Unknown loss function: {args.loss}")
     else:
-        raise ValueError(f"Unknown loss function: {args.loss}")
+        # For segmentation models, operate on (N,1,H,W) probabilities vs (N,1,H,W) masks using BCELoss
+        criterion = nn.BCELoss()
     
     # Define optimizer
     if args.optimizer == "adam":

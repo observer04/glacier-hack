@@ -9,27 +9,40 @@ from sklearn.metrics import matthews_corrcoef, f1_score, precision_score, recall
 import seaborn as sns
 
 # Import our modules
-from data_utils import GlacierDataset
+from data_utils import GlacierDataset, create_segmentation_dataloaders
 from models import PixelANN, UNet, DeepLabV3Plus
 
-def evaluate_model(model, dataloader, device):
-    """Evaluate model on dataset."""
+def evaluate_model(model, dataloader, device, is_segmentation: bool):
+    """Evaluate model on dataset.
+
+    Args:
+        model: torch model
+        dataloader: DataLoader yielding either (pixels, labels) for pixel-wise or (tiles, masks) for segmentation
+        device: torch.device
+        is_segmentation: True for UNet/DeepLab, False for PixelANN
+    """
     model.eval()
     all_preds = []
     all_targets = []
-    
+
     with torch.no_grad():
         for inputs, targets in tqdm(dataloader, desc="Evaluating"):
             inputs = inputs.to(device)
-            targets = targets.to(device).view(-1, 1)
-            
-            # Forward pass
-            outputs = model(inputs)
-            
-            # Store predictions and targets for metrics
-            preds = (outputs > 0.5).float().cpu().numpy()
-            all_preds.extend(preds.flatten())
-            all_targets.extend(targets.cpu().numpy().flatten())
+            if is_segmentation:
+                # targets shape: (N, H, W) -> (N,1,H,W) for consistency then flatten
+                targets_tensor = targets.to(device).unsqueeze(1)
+                outputs = model(inputs)  # (N,1,H,W)
+                preds = (outputs > 0.5).float().cpu().numpy().reshape(-1)
+                targs = targets_tensor.cpu().numpy().reshape(-1)
+            else:
+                # Pixel-wise: inputs (B,5), targets (B,)
+                targets = targets.to(device).view(-1, 1)
+                outputs = model(inputs)
+                preds = (outputs > 0.5).float().cpu().numpy().reshape(-1)
+                targs = targets.cpu().numpy().reshape(-1)
+
+            all_preds.extend(preds.tolist())
+            all_targets.extend(targs.tolist())
     
     # Calculate metrics
     mcc = matthews_corrcoef(all_targets, all_preds)
@@ -75,17 +88,27 @@ def main(args):
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Create dataset
-    dataset = GlacierDataset(args.data_dir, is_training=False, val_split=args.val_split)
-    
-    # Create dataloader
-    dataloader = DataLoader(
-        dataset, 
-        batch_size=args.batch_size, 
-        shuffle=False, 
-        num_workers=args.num_workers,
-        pin_memory=True
-    )
+    # Create dataloader suitable for the model type
+    if args.model_type == "pixelann":
+        dataset = GlacierDataset(args.data_dir, is_training=False, val_split=args.val_split)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
+        is_segmentation = False
+    else:
+        # Full-tile dataloader; use a small batch to fit memory on CPU
+        _, val_loader = create_segmentation_dataloaders(
+            args.data_dir,
+            batch_size=1,
+            val_split=args.val_split,
+            num_workers=args.num_workers,
+        )
+        dataloader = val_loader
+        is_segmentation = True
     
     # Create model
     if args.model_type == "pixelann":
@@ -107,7 +130,7 @@ def main(args):
     print(f"Model loaded from {args.model_path}")
     
     # Evaluate model
-    metrics = evaluate_model(model, dataloader, device)
+    metrics = evaluate_model(model, dataloader, device, is_segmentation)
     
     # Print metrics
     print(f"MCC: {metrics['mcc']:.4f}")

@@ -109,19 +109,17 @@ class DeepLabV3Plus(nn.Module):
         super(DeepLabV3Plus, self).__init__()
         
         # Use a lighter backbone for model size constraints
-        self.backbone = nn.Sequential(
-            # Initial conv to increase channels
+        # Split into stem + layers to tap low-level (128-ch) features cleanly
+        self.stem = nn.Sequential(
             nn.Conv2d(in_channels, 64, kernel_size=3, stride=1, padding=1, bias=False),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-            
-            # Downsample blocks
-            self._make_layer(64, 128, stride=2),
-            self._make_layer(128, 256, stride=2),
-            self._make_layer(256, 512, stride=2),
-            self._make_layer(512, 512, stride=1, dilation=2),
         )
-        
+        self.layer1 = self._make_layer(64, 128, stride=2)   # low-level features (1/2 res)
+        self.layer2 = self._make_layer(128, 256, stride=2)  # (1/4 res)
+        self.layer3 = self._make_layer(256, 512, stride=2)  # (1/8 res)
+        self.layer4 = self._make_layer(512, 512, stride=1, dilation=2)
+
         self.low_level_features = nn.Sequential(
             nn.Conv2d(128, 48, 1, bias=False),
             nn.BatchNorm2d(48),
@@ -201,41 +199,39 @@ class DeepLabV3Plus(nn.Module):
         
     def forward(self, x):
         # Save input size for final upsampling
-        input_size = x.shape[-2:]
-        
+        inp_size = x.shape[-2:]
+
         # Extract features
-        x1 = self.backbone[0:3](x)  # Low-level features
-        x = self.backbone[3:](x1)   # High-level features
-        
-        # Apply ASPP modules
+        x0 = self.stem(x)               # (N,64,H,W)
+        x1 = self.layer1(x0)            # (N,128,H/2,W/2) low-level
+        x2 = self.layer2(x1)            # (N,256,H/4,W/4)
+        x3 = self.layer3(x2)            # (N,512,H/8,W/8)
+        x = self.layer4(x3)             # (N,512,H/8,W/8) high-level
+
+        # ASPP on high-level features
         aspp_1x1_out = self.aspp_1x1(x)
         aspp_3x3_1_out = self.aspp_3x3_1(x)
         aspp_3x3_2_out = self.aspp_3x3_2(x)
         aspp_3x3_3_out = self.aspp_3x3_3(x)
-        
-        # Apply global pooling module separately (needs special handling for interpolation)
+
         global_pool = self.aspp_pool(x)
         global_pool = F.interpolate(global_pool, size=x.shape[-2:], mode='bilinear', align_corners=False)
-        
-        # Concatenate all ASPP results
+
+        # Concatenate ASPP results and project
         x = torch.cat([aspp_1x1_out, aspp_3x3_1_out, aspp_3x3_2_out, aspp_3x3_3_out, global_pool], dim=1)
-        
-        # Apply projection
         x = self.aspp_project(x)
-        
+
         # Process low-level features
-        x1 = self.low_level_features(x1)
-        
-        # Upsample high-level features
-        x = F.interpolate(x, size=x1.shape[-2:], mode='bilinear', align_corners=False)
-        
-        # Concatenate low and high level features
-        x = torch.cat([x, x1], dim=1)
-        
+        low = self.low_level_features(x1)
+
+        # Upsample high-level to low-level resolution and fuse
+        x = F.interpolate(x, size=low.shape[-2:], mode='bilinear', align_corners=False)
+        x = torch.cat([x, low], dim=1)
+
         # Decoder
         x = self.decoder(x)
-        
+
         # Final upsampling to original image size
-        x = F.interpolate(x, size=input_size, mode='bilinear', align_corners=False)
-        
+        x = F.interpolate(x, size=inp_size, mode='bilinear', align_corners=False)
+
         return self.sigmoid(x)

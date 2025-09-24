@@ -4,10 +4,150 @@ import os
 import re
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
+class DeepLabV3Plus(nn.Module):
+    """DeepLabV3+ model for semantic segmentation."""
+    
+    def __init__(self, in_channels=5, out_channels=1):
+        super(DeepLabV3Plus, self).__init__()
+        
+        # Use a lighter backbone for model size constraints
+        self.backbone = nn.Sequential(
+            # Initial conv to increase channels
+            nn.Conv2d(in_channels, 64, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            
+            # Downsample blocks
+            self._make_layer(64, 128, stride=2),
+            self._make_layer(128, 256, stride=2),
+            self._make_layer(256, 512, stride=2),
+            self._make_layer(512, 512, stride=1, dilation=2),
+        )
+        
+        self.low_level_features = nn.Sequential(
+            nn.Conv2d(128, 48, 1, bias=False),
+            nn.BatchNorm2d(48),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.aspp = self._build_aspp(512, 256)
+        
+        self.decoder = nn.Sequential(
+            nn.Conv2d(256 + 48, 256, 3, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, 3, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, out_channels, 1)
+        )
+        
+        self.sigmoid = nn.Sigmoid()
+        
+    def _make_layer(self, in_channels, out_channels, stride=1, dilation=1):
+        return nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, 
+                     padding=dilation, dilation=dilation, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=dilation, 
+                     dilation=dilation, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+    
+    def _build_aspp(self, in_channels, out_channels):
+        # 1x1 convolution
+        self.aspp_1x1 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Atrous convolutions with different rates
+        self.aspp_3x3_1 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=6, dilation=6, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.aspp_3x3_2 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=12, dilation=12, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.aspp_3x3_3 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=18, dilation=18, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Global average pooling
+        self.aspp_pool = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Project to reduce channels
+        self.aspp_project = nn.Sequential(
+            nn.Conv2d(5 * out_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5)
+        )
+        
+        return nn.ModuleList([self.aspp_1x1, self.aspp_3x3_1, self.aspp_3x3_2, self.aspp_3x3_3, self.aspp_pool])
+        
+    def forward(self, x):
+        # Save input size for final upsampling
+        input_size = x.shape[-2:]
+        
+        # Extract features
+        x1 = self.backbone[0:3](x)  # Low-level features
+        x = self.backbone[3:](x1)   # High-level features
+        
+        # Apply ASPP modules
+        aspp_1x1_out = self.aspp_1x1(x)
+        aspp_3x3_1_out = self.aspp_3x3_1(x)
+        aspp_3x3_2_out = self.aspp_3x3_2(x)
+        aspp_3x3_3_out = self.aspp_3x3_3(x)
+        
+        # Apply global pooling module separately (needs special handling for interpolation)
+        global_pool = self.aspp_pool(x)
+        global_pool = F.interpolate(global_pool, size=x.shape[-2:], mode='bilinear', align_corners=False)
+        
+        # Concatenate all ASPP results
+        x = torch.cat([aspp_1x1_out, aspp_3x3_1_out, aspp_3x3_2_out, aspp_3x3_3_out, global_pool], dim=1)
+        
+        # Apply projection
+        x = self.aspp_project(x)
+        
+        # Process low-level features
+        x1 = self.low_level_features(x1)
+        
+        # Upsample high-level features
+        x = F.interpolate(x, size=x1.shape[-2:], mode='bilinear', align_corners=False)
+        
+        # Concatenate low and high level features
+        x = torch.cat([x, x1], dim=1)
+        
+        # Decoder
+        x = self.decoder(x)
+        
+        # Final upsampling to original image size
+        x = F.interpolate(x, size=input_size, mode='bilinear', align_corners=False)
+        
+        return self.sigmoid(x)
+
+# Fallback to simpler model if needed
 class PixelANN(nn.Module):
     """Simple pixel-wise ANN for glacier segmentation."""
     
@@ -61,9 +201,19 @@ def maskgeration(imagepath, out_dir):
     # Create output directory if it doesn't exist
     os.makedirs(out_dir, exist_ok=True)
     
-    # Load model
-    model = PixelANN(in_channels=5, hidden_dims=[32, 64, 128, 64, 32], dropout_rate=0.0)
-    model.load_state_dict(torch.load("model.pth", map_location="cpu"))
+    # Try to load DeepLabV3+ model first, fallback to PixelANN if it fails
+    try:
+        model = DeepLabV3Plus(in_channels=5, out_channels=1)
+        model.load_state_dict(torch.load("model.pth", map_location="cpu"))
+        print("Using DeepLabV3+ model")
+        use_deeplab = True
+    except Exception as e:
+        print(f"Could not load DeepLabV3+ model: {e}")
+        print("Falling back to PixelANN model")
+        model = PixelANN(in_channels=5, hidden_dims=[32, 64, 128, 64, 32], dropout_rate=0.0)
+        model.load_state_dict(torch.load("model.pth", map_location="cpu"))
+        use_deeplab = False
+    
     model.eval()
     
     # Map band -> tile_id -> filename
@@ -109,41 +259,63 @@ def maskgeration(imagepath, out_dir):
             
             # Normalize the band
             arr_normalized = normalize_band(arr)
-            band_arrays.append(arr_normalized.flatten())
+            band_arrays.append(arr_normalized)
         
         if not band_arrays or len(band_arrays) != len(imagepath):
             continue
-            
-        # Stack bands to create feature matrix
-        X = np.stack(band_arrays, axis=1)  # (H*W, 5)
         
-        # Create cloud mask (all zeros)
-        cloud_mask = np.all(X == 0, axis=1)
-        
-        # Process non-cloud pixels
-        X_valid = X[~cloud_mask]
-        
-        if X_valid.shape[0] > 0:
-            # Process in batches to avoid memory issues
-            batch_size = 10000
-            all_preds = []
+        if not band_arrays or len(band_arrays) != len(imagepath) or H is None or W is None:
+            # Skip tiles with missing bands
+            continue
             
-            for i in range(0, X_valid.shape[0], batch_size):
-                batch = torch.tensor(X_valid[i:i+batch_size], dtype=torch.float32)
-                with torch.no_grad():
-                    preds = model(batch).squeeze()
-                    all_preds.append((preds < 0.5).int().numpy())  # Note: < 0.5 because 1 is glacier
+        if use_deeplab:
+            # Stack bands to create an image tensor (C, H, W)
+            X = np.stack(band_arrays, axis=0)
             
-            # Combine batches
-            preds = np.concatenate(all_preds)
+            # Convert to tensor
+            X_tensor = torch.tensor(X, dtype=torch.float32).unsqueeze(0)  # Add batch dimension
             
-            # Create full mask (0=non-glacier, 255=glacier)
-            full_mask = np.zeros(H * W, dtype=np.uint8)
-            full_mask[~cloud_mask] = preds
-            full_mask = full_mask.reshape(H, W) * 255
+            # Process with DeepLabV3+
+            with torch.no_grad():
+                pred = model(X_tensor).squeeze()
+                
+            # Create binary mask
+            full_mask = (pred > 0.5).cpu().numpy().astype(np.uint8) * 255
+            
         else:
-            # All pixels are cloud, create empty mask
-            full_mask = np.zeros((H, W), dtype=np.uint8)
+            # For PixelANN, we need to flatten the bands
+            band_arrays_flat = [band.flatten() for band in band_arrays]
+            
+            # Stack bands to create feature matrix
+            X = np.stack(band_arrays_flat, axis=1)  # (H*W, 5)
+            
+            # Create cloud mask (all zeros)
+            cloud_mask = np.all(X == 0, axis=1)
+            
+            # Process non-cloud pixels
+            X_valid = X[~cloud_mask]
+            
+            if X_valid.shape[0] > 0:
+                # Process in batches to avoid memory issues
+                batch_size = 10000
+                all_preds = []
+                
+                for i in range(0, X_valid.shape[0], batch_size):
+                    batch = torch.tensor(X_valid[i:i+batch_size], dtype=torch.float32)
+                    with torch.no_grad():
+                        preds = model(batch).squeeze()
+                        all_preds.append((preds > 0.5).int().numpy())  # Values > 0.5 correspond to glacier pixels
+                
+                # Combine batches
+                preds = np.concatenate(all_preds)
+                
+                # Create full mask (0=non-glacier, 255=glacier)
+                full_mask = np.zeros(H * W, dtype=np.uint8)
+                full_mask[~cloud_mask] = preds
+                full_mask = full_mask.reshape(H, W) * 255
+            else:
+                # All pixels are cloud, create empty mask
+                full_mask = np.zeros((H, W), dtype=np.uint8)
         
         # Save the mask
         output_path = os.path.join(out_dir, f"{tile_id}.tif")

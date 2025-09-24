@@ -40,8 +40,16 @@ def analyze_sample_image():
         return
     
     sample_label_file = label_files[0]
-    # Extract the tile ID from the label filename
-    sample_id = os.path.basename(sample_label_file).replace(".tif", "").replace("Y", "")
+    # Extract the tile ID from the label filename (support multiple patterns)
+    base = os.path.splitext(os.path.basename(sample_label_file))[0]
+    if base.startswith("Y_output_resized_"):
+        sample_id = base[len("Y_output_resized_"):]
+    elif base.startswith("Y"):
+        sample_id = base[1:]
+    else:
+        import re
+        m = re.search(r"(\d{2}_\d{2})", base)
+        sample_id = m.group(1) if m else base
     print(f"Sample tile ID: {sample_id}")
     
     # Find corresponding band files
@@ -110,7 +118,10 @@ def analyze_class_distribution():
     
     # Plot class distribution
     plt.figure(figsize=(8, 6))
-    plt.pie([total_glacier_pixels, total_pixels - total_glacier_pixels], 
+    # Cast to float to avoid type issues with some backends/linters
+    glacier_val = float(total_glacier_pixels)
+    non_glacier_val = float(total_pixels - total_glacier_pixels)
+    plt.pie([glacier_val, non_glacier_val], 
             labels=["Glacier", "Non-Glacier"], 
             autopct='%1.1f%%',
             colors=['lightblue', 'lightgray'])
@@ -127,6 +138,7 @@ def analyze_band_statistics():
     
     # Get a sample of files
     all_files = []
+    band_indices = []  # Keep track of band indices
     for i, band_dir in enumerate(band_dirs):
         if not os.path.exists(band_dir):
             continue
@@ -136,26 +148,33 @@ def analyze_band_statistics():
             # Take 10 sample files or all if less than 10
             sample_files = files[:min(10, len(files))]
             all_files.append(sample_files)
+            band_indices.append(i)  # Store the band index
     
     # Process each set of band files
-    for i, files in enumerate(all_files):
-        for file_path in tqdm(files, desc=f"Processing Band {i+1}"):
+    for idx, files in enumerate(all_files):
+        band_i = band_indices[idx]  # Get the correct band index
+        for file_path in tqdm(files, desc=f"Processing Band {band_i+1}"):
             arr = np.array(Image.open(file_path))
             if arr.ndim == 3:
                 arr = arr[..., 0]
                 
             # Calculate statistics
-            band_means[i].append(np.mean(arr))
-            band_stds[i].append(np.std(arr))
+            band_means[band_i].append(np.mean(arr))
+            band_stds[band_i].append(np.std(arr))
     
-    # Print statistics
+    # Print statistics and prepare plotting data
+    x_values = []
+    y_values = []
     for i in range(len(band_dirs)):
         if band_means[i]:
-            print(f"Band {i+1} mean: {np.mean(band_means[i]):.2f}, std: {np.mean(band_stds[i]):.2f}")
+            mean_value = np.mean(band_means[i])
+            print(f"Band {i+1} mean: {mean_value:.2f}, std: {np.mean(band_stds[i]):.2f}")
+            x_values.append(i+1)
+            y_values.append(mean_value)
     
     # Plot statistics
     plt.figure(figsize=(10, 6))
-    plt.bar(range(1, len(band_dirs)+1), [np.mean(means) if means else 0 for means in band_means])
+    plt.bar(x_values, y_values)
     plt.xlabel("Band")
     plt.ylabel("Mean Pixel Value")
     plt.title("Average Pixel Value by Band")
