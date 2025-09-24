@@ -309,12 +309,13 @@ def train_model(model, train_loader, val_loader, criterion, optimizer,
                     targets_t = targets.to(device)
                 with torch.cuda.amp.autocast():
                     outputs = model(inputs)
-                    if outputs.dim() == 4 and targets_t.dim() == 3:
-                        loss = criterion(outputs, targets_t.unsqueeze(1))
-                    elif outputs.dim() == 4 and targets_t.dim() == 4:
-                        loss = criterion(outputs, targets_t)
-                    else:
-                        loss = criterion(outputs, targets_t)
+                # Compute loss outside autocast for BCE-style stability (models already output probs)
+                if outputs.dim() == 4 and targets_t.dim() == 3:
+                    loss = criterion(outputs.float(), targets_t.unsqueeze(1).float())
+                elif outputs.dim() == 4 and targets_t.dim() == 4:
+                    loss = criterion(outputs.float(), targets_t.float())
+                else:
+                    loss = criterion(outputs.float(), targets_t.float())
                 if accum_steps > 1:
                     scaler.scale(loss / accum_steps).backward()
                     do_step = ((step + 1) % accum_steps == 0) or (step + 1 == len(train_loader))
