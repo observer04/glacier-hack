@@ -7,7 +7,7 @@ import torch.optim as optim
 # Import our modules
 from data_utils import create_dataloaders, create_segmentation_dataloaders
 from models import PixelANN, UNet, DeepLabV3Plus
-from train_utils import train_model, CombinedLoss, FocalLoss, DiceLoss
+from train_utils import train_model, CombinedLoss, FocalLoss, DiceLoss, WeightedBCELoss
 
 def main(args):
     # Set device
@@ -53,17 +53,30 @@ def main(args):
     if args.model_type == "pixelann":
         if args.loss == "bce":
             criterion = nn.BCELoss()
+        elif args.loss == "wbce":
+            criterion = WeightedBCELoss(pos_weight=args.pos_weight)
         elif args.loss == "focal":
-            criterion = FocalLoss(alpha=0.25, gamma=2.0)
+            criterion = FocalLoss(alpha=args.focal_alpha, gamma=args.focal_gamma)
         elif args.loss == "dice":
             criterion = DiceLoss()
         elif args.loss == "combined":
-            criterion = CombinedLoss(alpha=0.5, beta=0.5)
+            criterion = CombinedLoss(alpha=args.combined_alpha, beta=args.combined_beta)
         else:
             raise ValueError(f"Unknown loss function: {args.loss}")
     else:
-        # For segmentation models, operate on (N,1,H,W) probabilities vs (N,1,H,W) masks using BCELoss
-        criterion = nn.BCELoss()
+        # Segmentation models support the same family of losses
+        if args.loss == "bce":
+            criterion = nn.BCELoss()
+        elif args.loss == "wbce":
+            criterion = WeightedBCELoss(pos_weight=args.pos_weight)
+        elif args.loss == "focal":
+            criterion = FocalLoss(alpha=args.focal_alpha, gamma=args.focal_gamma)
+        elif args.loss == "dice":
+            criterion = DiceLoss()
+        elif args.loss == "combined":
+            criterion = CombinedLoss(alpha=args.combined_alpha, beta=args.combined_beta)
+        else:
+            raise ValueError(f"Unknown loss function: {args.loss}")
     
     # Define optimizer
     if args.optimizer == "adam":
@@ -100,7 +113,9 @@ def main(args):
         num_epochs=args.epochs,
         device=device_str,
         model_save_path=args.model_save_path,
-        early_stopping_patience=args.early_stopping_patience
+        early_stopping_patience=args.early_stopping_patience,
+        accum_steps=args.accum_steps,
+        grad_clip=args.grad_clip
     )
     
     # Save final model
@@ -129,10 +144,17 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=50, help="Number of epochs to train")
     parser.add_argument("--learning_rate", type=float, default=0.001, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-5, help="Weight decay for optimizer")
-    parser.add_argument("--loss", type=str, default="bce", choices=["bce", "focal", "dice", "combined"], help="Loss function")
+    parser.add_argument("--loss", type=str, default="bce", choices=["bce", "wbce", "focal", "dice", "combined"], help="Loss function")
+    parser.add_argument("--pos_weight", type=float, default=1.0, help="Positive class weight for WBCE")
+    parser.add_argument("--focal_alpha", type=float, default=0.25, help="Focal loss alpha")
+    parser.add_argument("--focal_gamma", type=float, default=2.0, help="Focal loss gamma")
+    parser.add_argument("--combined_alpha", type=float, default=0.5, help="Weight for BCE part in CombinedLoss")
+    parser.add_argument("--combined_beta", type=float, default=0.5, help="Weight for Dice part in CombinedLoss")
     parser.add_argument("--optimizer", type=str, default="adam", choices=["adam", "sgd"], help="Optimizer")
     parser.add_argument("--scheduler", type=str, default="plateau", choices=["plateau", "cosine", "none"], help="Learning rate scheduler")
     parser.add_argument("--early_stopping_patience", type=int, default=10, help="Patience for early stopping")
+    parser.add_argument("--accum_steps", type=int, default=1, help="Gradient accumulation steps (segmentation models)")
+    parser.add_argument("--grad_clip", type=float, default=0.0, help="Gradient clipping max norm (0 to disable)")
     
     # System parameters
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"], help="Device to use")

@@ -87,6 +87,27 @@ class CombinedLoss(nn.Module):
     def forward(self, y_pred, y_true):
         return self.alpha * self.bce(y_pred, y_true) + self.beta * self.dice(y_pred, y_true)
 
+class WeightedBCELoss(nn.Module):
+    """Binary Cross-Entropy with a scalar positive-class weight, operating on probabilities.
+
+    Note: Models here output probabilities via sigmoid. For better numerical stability,
+    we clamp predictions to (eps, 1-eps) before computing -[ y*log(p)*pos_w + (1-y)*log(1-p) ].
+    """
+
+    def __init__(self, pos_weight: float = 1.0, eps: float = 1e-6):
+        super().__init__()
+        self.pos_weight = float(pos_weight)
+        self.eps = eps
+
+    def forward(self, y_pred, y_true):
+        y_pred = torch.clamp(y_pred, self.eps, 1.0 - self.eps)
+        loss_pos = -torch.log(y_pred) * y_true
+        loss_neg = -torch.log(1.0 - y_pred) * (1.0 - y_true)
+        if self.pos_weight != 1.0:
+            loss_pos = loss_pos * self.pos_weight
+        loss = loss_pos + loss_neg
+        return loss.mean()
+
 def _compute_metrics_from_logits(outputs, targets):
     # outputs and targets can be (N,1) or (N,1,H,W) or (N,H,W)
     with torch.no_grad():
@@ -106,14 +127,15 @@ def _compute_metrics_from_logits(outputs, targets):
     return mcc, f1, precision, recall
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device):
+def train_epoch(model, dataloader, criterion, optimizer, device, accum_steps: int = 1, grad_clip: float = 0.0):
     """Train model for one epoch (supports pixel-wise and tile-wise)."""
     model.train()
     running_loss = 0.0
     all_preds = []
     all_targets = []
 
-    for inputs, targets in tqdm(dataloader, desc="Training"):
+    optimizer.zero_grad()
+    for step, (inputs, targets) in enumerate(tqdm(dataloader, desc="Training")):
         inputs = inputs.to(device)
         # Targets: pixel (N,) or (N,1) vs tile (N,H,W)
         # Normalize shapes for loss
@@ -123,8 +145,6 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
             targets_t = targets.unsqueeze(1).to(device)  # (N,1,H,W) later
         else:
             targets_t = targets.to(device)
-
-        optimizer.zero_grad()
 
         outputs = model(inputs)
 
@@ -137,8 +157,21 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
         else:
             loss = criterion(outputs, targets_t)
 
-        loss.backward()
-        optimizer.step()
+        # Gradient accumulation
+        if accum_steps > 1:
+            (loss / accum_steps).backward()
+            do_step = ((step + 1) % accum_steps == 0) or (step + 1 == len(dataloader))
+            if do_step:
+                if grad_clip and grad_clip > 0.0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+                optimizer.step()
+                optimizer.zero_grad()
+        else:
+            loss.backward()
+            if grad_clip and grad_clip > 0.0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            optimizer.step()
+            optimizer.zero_grad()
 
         running_loss += loss.item() * inputs.size(0)
 
@@ -199,7 +232,8 @@ def validate(model, dataloader, criterion, device):
 
 def train_model(model, train_loader, val_loader, criterion, optimizer, 
                scheduler=None, num_epochs=50, device="cuda", 
-               model_save_path="models", early_stopping_patience=10):
+               model_save_path="models", early_stopping_patience=10,
+               accum_steps: int = 1, grad_clip: float = 0.0):
     """Train model with validation and early stopping."""
     # Create directory for saving models if it doesn't exist
     os.makedirs(model_save_path, exist_ok=True)
@@ -227,7 +261,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer,
         
         # Train epoch
         train_loss, train_mcc, train_f1, train_precision, train_recall = train_epoch(
-            model, train_loader, criterion, optimizer, device
+            model, train_loader, criterion, optimizer, device, accum_steps=accum_steps, grad_clip=grad_clip
         )
         
         # Validate epoch

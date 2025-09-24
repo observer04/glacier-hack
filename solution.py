@@ -9,6 +9,13 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
+# Try to import UNet from repo models for exact architecture match
+try:
+    from models import UNet as RepoUNet
+    _HAS_REPO_UNET = True
+except Exception:
+    _HAS_REPO_UNET = False
+
 class DeepLabV3Plus(nn.Module):
     """DeepLabV3+ model for semantic segmentation."""
     
@@ -200,19 +207,59 @@ def maskgeration(imagepath, out_dir):
     """
     # Create output directory if it doesn't exist
     os.makedirs(out_dir, exist_ok=True)
-    
-    # Try to load DeepLabV3+ model first, fallback to PixelANN if it fails
+
+    # Config: allow model path/type/threshold via environment
+    model_path = os.getenv("SOLUTION_MODEL_PATH", "model.pth")
+    model_pref = os.getenv("SOLUTION_MODEL_TYPE", "auto").lower()  # auto|unet|deeplabv3plus|pixelann
     try:
-        model = DeepLabV3Plus(in_channels=5, out_channels=1)
-        model.load_state_dict(torch.load("model.pth", map_location="cpu"))
-        print("Using DeepLabV3+ model")
-        use_deeplab = True
-    except Exception as e:
-        print(f"Could not load DeepLabV3+ model: {e}")
-        print("Falling back to PixelANN model")
-        model = PixelANN(in_channels=5, hidden_dims=[32, 64, 128, 64, 32], dropout_rate=0.0)
-        model.load_state_dict(torch.load("model.pth", map_location="cpu"))
-        use_deeplab = False
+        threshold = float(os.getenv("SOLUTION_THRESHOLD", "0.5"))
+    except Exception:
+        threshold = 0.5
+
+    def _try_load(model_ctor, label: str):
+        m = model_ctor()
+        m.load_state_dict(torch.load(model_path, map_location="cpu"))
+        print(f"Using {label} model from {model_path} with threshold {threshold}")
+        return m
+
+    model = None
+    use_segmentation = False  # True for UNet/DeepLab
+
+    # Determine load order
+    load_order = []
+    if model_pref == "unet":
+        load_order = ["unet"]
+    elif model_pref == "deeplabv3plus":
+        load_order = ["deeplabv3plus"]
+    elif model_pref == "pixelann":
+        load_order = ["pixelann"]
+    else:
+        # Auto: prefer UNet -> DeepLab -> PixelANN
+        load_order = ["unet", "deeplabv3plus", "pixelann"]
+
+    last_err = None
+    for kind in load_order:
+        try:
+            if kind == "unet":
+                if not _HAS_REPO_UNET:
+                    raise RuntimeError("UNet class not available in solution.py environment")
+                model = _try_load(lambda: RepoUNet(in_channels=5, out_channels=1), "UNet")
+                use_segmentation = True
+                break
+            elif kind == "deeplabv3plus":
+                model = _try_load(lambda: DeepLabV3Plus(in_channels=5, out_channels=1), "DeepLabV3+")
+                use_segmentation = True
+                break
+            else:
+                model = _try_load(lambda: PixelANN(in_channels=5, hidden_dims=[32, 64, 128, 64, 32], dropout_rate=0.0), "PixelANN")
+                use_segmentation = False
+                break
+        except Exception as e:
+            last_err = e
+            print(f"Could not load {kind}: {e}")
+            continue
+    if model is None:
+        raise RuntimeError(f"Failed to load any model from {model_path}. Last error: {last_err}")
     
     model.eval()
     
@@ -268,7 +315,7 @@ def maskgeration(imagepath, out_dir):
             # Skip tiles with missing bands
             continue
             
-        if use_deeplab:
+        if use_segmentation:
             # Stack bands to create an image tensor (C, H, W)
             X = np.stack(band_arrays, axis=0)
             
@@ -280,7 +327,7 @@ def maskgeration(imagepath, out_dir):
                 pred = model(X_tensor).squeeze()
                 
             # Create binary mask
-            full_mask = (pred > 0.5).cpu().numpy().astype(np.uint8) * 255
+            full_mask = (pred > threshold).cpu().numpy().astype(np.uint8) * 255
             
         else:
             # For PixelANN, we need to flatten the bands
@@ -304,7 +351,7 @@ def maskgeration(imagepath, out_dir):
                     batch = torch.tensor(X_valid[i:i+batch_size], dtype=torch.float32)
                     with torch.no_grad():
                         preds = model(batch).squeeze()
-                        all_preds.append((preds > 0.5).int().numpy())  # Values > 0.5 correspond to glacier pixels
+                        all_preds.append((preds > threshold).int().numpy())  # threshold corresponds to glacier pixels
                 
                 # Combine batches
                 preds = np.concatenate(all_preds)

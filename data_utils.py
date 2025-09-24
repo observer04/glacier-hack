@@ -95,16 +95,22 @@ class GlacierDataset(Dataset):
         self.tile_ids = train_ids if is_training else val_ids
         print(f"{'Training' if is_training else 'Validation'} dataset with {len(self.tile_ids)} tiles")
         
-        # Initialize pixel data and labels
-        self.pixels = []
-        self.labels = []
+        # Initialize arrays; load_data will populate real values
+        self.pixels = np.empty((0, 5), dtype=np.float32)
+        self.labels = np.empty((0,), dtype=np.float32)
+        # Populate via loader (uses local accumulators)
         self.load_data()
         
     def load_data(self):
         """Load all pixel data and labels for the dataset."""
+        pixels_list = []
+        labels_list = []
         for tile_id in self.tile_ids:
-            # Load all bands
-            band_arrays = []
+            # Load all bands (keep raw for valid mask; store normalized for features)
+            band_arrays_norm = []
+            zero_masks = []
+            H = W = None
+            shapes = []
             for band_idx in range(len(self.band_dirs)):
                 file_path = os.path.join(
                     self.band_dirs[band_idx], 
@@ -113,13 +119,23 @@ class GlacierDataset(Dataset):
                 arr = np.array(Image.open(file_path))
                 if arr.ndim == 3:
                     arr = arr[..., 0]
-                    
+                if H is None:
+                    H, W = arr.shape
+                shapes.append(arr.shape)
+                # Clean NaN/Inf in raw band
+                if np.isnan(arr).any() or np.isinf(arr).any():
+                    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+                zero_masks.append(arr == 0)
                 # Normalize the band
-                arr = normalize_band(arr)
-                band_arrays.append(arr)
-                
-            # Stack bands to form a 5-channel image
-            bands_stacked = np.stack(band_arrays, axis=0)  # (5, H, W)
+                arr_norm = normalize_band(arr)
+                band_arrays_norm.append(arr_norm)
+
+            # Shape consistency across bands
+            if any(s != shapes[0] for s in shapes):
+                raise ValueError(f"Band shape mismatch for tile {tile_id}: {shapes}")
+
+            # Stack normalized bands to form a 5-channel image
+            bands_stacked = np.stack(band_arrays_norm, axis=0).astype(np.float32)  # (5, H, W)
             
             # Load label (support multiple naming patterns)
             label_path = _find_label_path(self.label_dir, tile_id)
@@ -127,24 +143,35 @@ class GlacierDataset(Dataset):
                 # Skip if label missing (should be rare after valid_tile_ids filtering)
                 continue
             label = np.array(Image.open(label_path))
+            if label.ndim == 3:
+                label = label[..., 0]
+            if np.isnan(label).any() or np.isinf(label).any():
+                label = np.nan_to_num(label, nan=0.0, posinf=0.0, neginf=0.0)
             label = (label > 0).astype(np.float32)
+
+            if label.shape != (H, W):
+                raise ValueError(f"Label shape {label.shape} does not match bands {(H, W)} for tile {tile_id}")
             
-            # Convert to pixel-wise samples
-            H, W = label.shape
+            # Compute valid pixels from raw bands: pixels where NOT all bands are zero
+            all_zero = np.all(np.stack(zero_masks, axis=0), axis=0)  # (H, W)
+            valid_pixels = ~all_zero
+            if not valid_pixels.any():
+                # Skip tiles with no valid pixels
+                continue
+
+            # Convert to pixel-wise samples and filter by valid mask
             X = np.transpose(bands_stacked, (1, 2, 0))  # (H, W, 5)
-            X = X.reshape(-1, 5)  # (H*W, 5)
-            y = label.reshape(-1)  # (H*W,)
-            
-            # Find pixels where not all bands are 0 (non-cloud pixels)
-            valid_pixels = ~np.all(X == 0, axis=1)
-            
-            # Add to dataset
-            self.pixels.append(X[valid_pixels])
-            self.labels.append(y[valid_pixels])
+            X = X.reshape(-1, 5)
+            y = label.reshape(-1)
+            valid_flat = valid_pixels.reshape(-1)
+            pixels_list.append(X[valid_flat])
+            labels_list.append(y[valid_flat])
         
         # Concatenate all pixels and labels
-        self.pixels = np.concatenate(self.pixels, axis=0)
-        self.labels = np.concatenate(self.labels, axis=0)
+        if len(pixels_list) == 0:
+            raise ValueError("No valid pixels found after filtering; check data integrity and masks.")
+        self.pixels = np.concatenate(pixels_list, axis=0)
+        self.labels = np.concatenate(labels_list, axis=0)
         print(f"Dataset contains {len(self.pixels)} pixels")
         
     def __len__(self):
