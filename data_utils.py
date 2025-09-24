@@ -187,10 +187,11 @@ class GlacierTileDataset(Dataset):
       - y: FloatTensor of shape (H, W) with values {0,1}
     """
 
-    def __init__(self, data_dir, is_training=True, val_split=0.2, random_state=42):
+    def __init__(self, data_dir, is_training=True, val_split=0.2, random_state=42, augment: bool=False):
         super().__init__()
         self.data_dir = data_dir
         self.is_training = is_training
+        self.augment = augment
 
         # Band dirs
         self.band_dirs = []
@@ -242,8 +243,16 @@ class GlacierTileDataset(Dataset):
             if arr.ndim == 3:
                 arr = arr[..., 0]
             H, W = arr.shape
+            # Clean NaN/Inf
+            if np.isnan(arr).any() or np.isinf(arr).any():
+                arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
             arr = normalize_band(arr)
             bands.append(arr)
+
+        # Assert all bands share the same shape
+        for k in range(1, len(bands)):
+            if bands[k].shape != bands[0].shape:
+                raise ValueError(f"Band shape mismatch for tile {tid}: {bands[k].shape} vs {bands[0].shape}")
 
         x = np.stack(bands, axis=0).astype(np.float32)  # (5, H, W)
 
@@ -253,15 +262,33 @@ class GlacierTileDataset(Dataset):
         y = np.array(Image.open(label_path))
         if y.ndim == 3:
             y = y[..., 0]
+        if np.isnan(y).any() or np.isinf(y).any():
+            y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
         y = (y > 0).astype(np.float32)  # (H, W)
+
+        # Simple augmentations for training
+        if self.is_training and self.augment:
+            # Random horizontal flip
+            if np.random.rand() < 0.5:
+                x = np.flip(x, axis=2).copy()
+                y = np.flip(y, axis=1).copy()
+            # Random vertical flip
+            if np.random.rand() < 0.5:
+                x = np.flip(x, axis=1).copy()
+                y = np.flip(y, axis=0).copy()
+            # Random 90-degree rotation
+            k = np.random.randint(0, 4)
+            if k:
+                x = np.rot90(x, k=k, axes=(1, 2)).copy()
+                y = np.rot90(y, k=k, axes=(0, 1)).copy()
 
         return torch.from_numpy(x), torch.from_numpy(y)
 
 
-def create_segmentation_dataloaders(data_dir, batch_size=2, val_split=0.2, num_workers=2):
+def create_segmentation_dataloaders(data_dir, batch_size=2, val_split=0.2, num_workers=2, augment: bool=False):
     """Create dataloaders for segmentation models operating on full tiles."""
-    train_dataset = GlacierTileDataset(data_dir, is_training=True, val_split=val_split)
-    val_dataset = GlacierTileDataset(data_dir, is_training=False, val_split=val_split)
+    train_dataset = GlacierTileDataset(data_dir, is_training=True, val_split=val_split, augment=augment)
+    val_dataset = GlacierTileDataset(data_dir, is_training=False, val_split=val_split, augment=False)
 
     train_loader = DataLoader(
         train_dataset,

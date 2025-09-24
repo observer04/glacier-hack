@@ -30,6 +30,7 @@ def main(args):
             batch_size=seg_batch,
             val_split=args.val_split,
             num_workers=args.num_workers,
+            augment=args.augment,
         )
     
     # Create model
@@ -137,6 +138,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"], help="Device to use")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of workers for data loading")
     parser.add_argument("--model_save_path", type=str, default="./models", help="Path to save models")
+    parser.add_argument("--augment", action="store_true", help="Enable simple flips/rotations for segmentation models")
     
     args = parser.parse_args()
     
