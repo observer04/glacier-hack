@@ -219,6 +219,7 @@ def maskgeration(imagepath: dict, out_dir: str):
     model_path = os.getenv("SOLUTION_MODEL_PATH", "model.pth")
     model_pref = os.getenv("SOLUTION_MODEL_TYPE", "auto").lower()  # auto|unet|deeplabv3plus|pixelann
     threshold = _get_threshold()
+    tta_enabled = os.getenv("SOLUTION_TTA", "0").lower() in {"1", "true", "yes"}
 
     def _try_load(model_ctor, label: str):
         m = model_ctor()
@@ -326,9 +327,42 @@ def maskgeration(imagepath: dict, out_dir: str):
             # Convert to tensor
             X_tensor = torch.tensor(X, dtype=torch.float32).unsqueeze(0)  # Add batch dimension
             
-            # Process with DeepLabV3+
             with torch.no_grad():
-                pred = model(X_tensor).squeeze()
+                if not tta_enabled:
+                    pred = model(X_tensor).squeeze()
+                else:
+                    # Basic TTA: identity, hflip, vflip, rot90(1,2,3)
+                    tta_preds = []
+                    def inv(op_idx, tensor):
+                        if op_idx == 0:
+                            return tensor
+                        elif op_idx == 1:
+                            return torch.flip(tensor, dims=[-1])
+                        elif op_idx == 2:
+                            return torch.flip(tensor, dims=[-2])
+                        elif op_idx == 3:
+                            return torch.rot90(tensor, -1, dims=[-2, -1])
+                        elif op_idx == 4:
+                            return torch.rot90(tensor, -2, dims=[-2, -1])
+                        elif op_idx == 5:
+                            return torch.rot90(tensor, -3, dims=[-2, -1])
+                    for op_idx in range(6):
+                        if op_idx == 0:
+                            aug = X_tensor
+                        elif op_idx == 1:
+                            aug = torch.flip(X_tensor, dims=[-1])
+                        elif op_idx == 2:
+                            aug = torch.flip(X_tensor, dims=[-2])
+                        elif op_idx == 3:
+                            aug = torch.rot90(X_tensor, 1, dims=[-2, -1])
+                        elif op_idx == 4:
+                            aug = torch.rot90(X_tensor, 2, dims=[-2, -1])
+                        elif op_idx == 5:
+                            aug = torch.rot90(X_tensor, 3, dims=[-2, -1])
+                        out = model(aug)
+                        out = inv(op_idx, out)
+                        tta_preds.append(out)
+                    pred = torch.stack(tta_preds, dim=0).mean(dim=0).squeeze()
                 
             # Create binary mask
             full_mask = (pred > threshold).cpu().numpy().astype(np.uint8) * 255

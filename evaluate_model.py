@@ -33,13 +33,42 @@ def compute_metrics(y_true, y_pred):
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
     return dict(mcc=mcc, f1=f1, precision=prec, recall=rec, confusion_matrix=cm)
 
-def evaluate_segmentation(model, loader, device, threshold):
+def _tta_transforms(x):
+    # List of lambdas producing augmented and inverse operations
+    # Each entry: (forward_fn, inverse_fn)
+    return [
+        (lambda t: t, lambda t: t),
+        (lambda t: torch.flip(t, dims=[-1]), lambda t: torch.flip(t, dims=[-1])),  # horizontal
+        (lambda t: torch.flip(t, dims=[-2]), lambda t: torch.flip(t, dims=[-2])),  # vertical
+        (lambda t: torch.rot90(t, 1, dims=[-2, -1]), lambda t: torch.rot90(t, -1, dims=[-2, -1])),
+        (lambda t: torch.rot90(t, 2, dims=[-2, -1]), lambda t: torch.rot90(t, -2, dims=[-2, -1])),
+        (lambda t: torch.rot90(t, 3, dims=[-2, -1]), lambda t: torch.rot90(t, -3, dims=[-2, -1])),
+    ]
+
+def evaluate_segmentation(model, loader, device, threshold, tta=False):
     ys, ps = [], []
     model.eval()
     with torch.no_grad():
         for xb, yb in loader:
             xb = xb.to(device)
-            logits = model(xb)
+            if not tta:
+                logits = model(xb)
+            else:
+                # Ensemble predictions
+                preds_accum = None
+                tta_list = _tta_transforms(xb)
+                for fwd, inv in tta_list:
+                    x_aug = fwd(xb)
+                    out = model(x_aug)
+                    out = inv(out)
+                    if preds_accum is None:
+                        preds_accum = out
+                    else:
+                        preds_accum += out
+                if preds_accum is None:
+                    logits = model(xb)
+                else:
+                    logits = preds_accum / len(tta_list)
             if logits.dim() == 2:
                 # Pixel model fallback: reshape if needed
                 n, hw = logits.shape
@@ -80,6 +109,7 @@ def main():
     ap.add_argument('--num_workers', type=int, default=2)
     ap.add_argument('--threshold', type=float, default=0.6)
     ap.add_argument('--output_dir', type=str, required=True)
+    ap.add_argument('--tta', action='store_true', help='Enable flip/rotate test-time augmentation (segmentation models only)')
     args = ap.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() and args.device == 'cuda' else 'cpu')
@@ -116,7 +146,7 @@ def main():
                 _, val_loader = create_segmentation_dataloaders(
                     args.data_dir, batch_size=args.batch_size
                 )
-        metrics = evaluate_segmentation(model, val_loader, device, args.threshold)
+        metrics = evaluate_segmentation(model, val_loader, device, args.threshold, tta=args.tta)
     else:
         try:
             _, val_loader = create_dataloaders(

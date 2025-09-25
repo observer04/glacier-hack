@@ -295,19 +295,31 @@ class GlacierTileDataset(Dataset):
 
         # Simple augmentations for training
         if self.is_training and self.augment:
-            # Random horizontal flip
+            # Geometric flips
             if np.random.rand() < 0.5:
                 x = np.flip(x, axis=2).copy()
                 y = np.flip(y, axis=1).copy()
-            # Random vertical flip
             if np.random.rand() < 0.5:
                 x = np.flip(x, axis=1).copy()
                 y = np.flip(y, axis=0).copy()
-            # Random 90-degree rotation
+            # Random 90 deg rotation
             k = np.random.randint(0, 4)
             if k:
                 x = np.rot90(x, k=k, axes=(1, 2)).copy()
                 y = np.rot90(y, k=k, axes=(0, 1)).copy()
+            # Photometric (brightness/contrast jitter) per band
+            if np.random.rand() < 0.7:
+                # Work on copy to avoid in-place broadcast surprises
+                for c in range(x.shape[0]):
+                    scale = 1.0 + (np.random.rand() * 0.4 - 0.2)  # +/-20%
+                    shift = (np.random.rand() * 0.2 - 0.1)        # +/-0.1
+                    x[c] = x[c] * scale + shift
+            # Gaussian noise
+            if np.random.rand() < 0.5:
+                noise_std = 0.05 * (np.random.rand() * 1.0)
+                x = x + np.random.normal(0, noise_std, size=x.shape).astype(np.float32)
+            # Clip to sane range after jitter/noise (normalized bands roughly ~[-3,3])
+            x = np.clip(x, -5.0, 5.0)
 
         return torch.from_numpy(x), torch.from_numpy(y)
 
