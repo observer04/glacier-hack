@@ -101,14 +101,17 @@ class DiceLoss(nn.Module):
 class CombinedLoss(nn.Module):
     """Combined loss function (BCE + Dice)."""
     
-    def __init__(self, alpha=0.5, beta=0.5):
+    def __init__(self, alpha=0.5, beta=0.5, eps: float = 1e-6):
         super(CombinedLoss, self).__init__()
         self.alpha = alpha
         self.beta = beta
+        self.eps = eps
         self.bce = nn.BCELoss()
         self.dice = DiceLoss()
         
     def forward(self, y_pred, y_true):
+        # Clamp probabilities for numerical stability
+        y_pred = torch.clamp(y_pred, self.eps, 1.0 - self.eps)
         return self.alpha * self.bce(y_pred, y_true) + self.beta * self.dice(y_pred, y_true)
 
 class WeightedBCELoss(nn.Module):
@@ -415,7 +418,8 @@ def train_model(model, train_loader, val_loader, criterion, optimizer,
         try:
             from torch.optim.swa_utils import update_bn
             update_bn(train_loader, swa_model, device=torch.device(device))
-            model.load_state_dict(swa_model.state_dict())
+            # AveragedModel wraps the original model; use underlying module if present
+            model.load_state_dict(getattr(swa_model, "module", swa_model).state_dict())
             print("Loaded SWA averaged weights")
         except Exception as e:
             print(f"SWA update failed: {e}, falling back to best model")
