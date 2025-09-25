@@ -32,22 +32,88 @@ def get_tile_id(filename):
     match = re.search(r"(\d{2}_\d{2})", filename)
     return match.group(1) if match else None
 
-def normalize_band(band):
+def normalize_band(band, global_stats=None):
     """Normalize a single band using mean and std."""
     band = band.astype(np.float32)
-    mean = np.mean(band)
-    std = np.std(band)
-    if std > 0:
-        return (band - mean) / std
-    return band
+    
+    if global_stats is not None:
+        # Use global statistics if provided
+        mean, std = global_stats
+        if std > 0:
+            return (band - mean) / std
+        return band - mean
+    else:
+        # Fallback to per-tile normalization
+        mean = np.mean(band)
+        std = np.std(band)
+        if std > 0:
+            return (band - mean) / std
+        return band
+
+def compute_global_stats(data_dir, sample_ratio=0.1):
+    """Compute global normalization statistics across all training tiles."""
+    print("Computing global normalization statistics...")
+    
+    band_dirs = [os.path.join(data_dir, f"Band{i}") for i in range(1, 6)]
+    all_files = []
+    
+    # Collect all files from all bands
+    for band_idx, band_dir in enumerate(band_dirs):
+        if not os.path.exists(band_dir):
+            continue
+        files = [f for f in os.listdir(band_dir) if f.endswith(".tif")]
+        all_files.extend([(band_idx, os.path.join(band_dir, f)) for f in files])
+    
+    # Sample a subset for efficiency
+    import random
+    random.shuffle(all_files)
+    sample_size = max(1, int(len(all_files) * sample_ratio))
+    sampled_files = all_files[:sample_size]
+    
+    # Collect statistics per band
+    band_stats = {i: {'values': []} for i in range(5)}
+    
+    from tqdm import tqdm
+    for band_idx, file_path in tqdm(sampled_files, desc="Computing global stats"):
+        try:
+            arr = np.array(Image.open(file_path))
+            if arr.ndim == 3:
+                arr = arr[..., 0]
+            
+            # Clean and flatten
+            if np.isnan(arr).any() or np.isinf(arr).any():
+                arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            # Only use non-zero pixels for statistics
+            valid_pixels = arr[arr > 0]
+            if len(valid_pixels) > 0:
+                band_stats[band_idx]['values'].extend(valid_pixels.flatten())
+        except Exception as e:
+            print(f"Error processing {file_path}: {e}")
+            continue
+    
+    # Compute mean and std per band
+    global_stats = {}
+    for band_idx in range(5):
+        if band_stats[band_idx]['values']:
+            values = np.array(band_stats[band_idx]['values'])
+            mean = np.mean(values)
+            std = np.std(values)
+            global_stats[band_idx] = (mean, std)
+            print(f"Band {band_idx + 1}: mean={mean:.2f}, std={std:.2f}")
+        else:
+            global_stats[band_idx] = (0.0, 1.0)  # Fallback
+            
+    return global_stats
 
 class GlacierDataset(Dataset):
     """Dataset for glacier segmentation with pixel-wise approach."""
     
-    def __init__(self, data_dir, is_training=True, val_split=0.2, random_state=42):
+    def __init__(self, data_dir, is_training=True, val_split=0.2, random_state=42, global_stats=None):
         super().__init__()
         self.data_dir = data_dir
         self.is_training = is_training
+        self.global_stats = global_stats
         
         # Get all band directories
         self.band_dirs = []
@@ -127,7 +193,8 @@ class GlacierDataset(Dataset):
                     arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
                 zero_masks.append(arr == 0)
                 # Normalize the band
-                arr_norm = normalize_band(arr)
+                band_stats = self.global_stats.get(band_idx) if self.global_stats else None
+                arr_norm = normalize_band(arr, band_stats)
                 band_arrays_norm.append(arr_norm)
 
             # Shape consistency across bands
@@ -182,10 +249,14 @@ class GlacierDataset(Dataset):
         label = self.labels[idx]
         return torch.tensor(pixel, dtype=torch.float32), torch.tensor(label, dtype=torch.float32)
 
-def create_dataloaders(data_dir, batch_size=4096, val_split=0.2, num_workers=4):
+def create_dataloaders(data_dir, batch_size=4096, val_split=0.2, num_workers=4, use_global_stats=False):
     """Create train and validation dataloaders."""
-    train_dataset = GlacierDataset(data_dir, is_training=True, val_split=val_split)
-    val_dataset = GlacierDataset(data_dir, is_training=False, val_split=val_split)
+    global_stats = None
+    if use_global_stats:
+        global_stats = compute_global_stats(data_dir, sample_ratio=0.1)
+    
+    train_dataset = GlacierDataset(data_dir, is_training=True, val_split=val_split, global_stats=global_stats)
+    val_dataset = GlacierDataset(data_dir, is_training=False, val_split=val_split, global_stats=global_stats)
     
     train_loader = DataLoader(
         train_dataset, 
@@ -214,11 +285,12 @@ class GlacierTileDataset(Dataset):
       - y: FloatTensor of shape (H, W) with values {0,1}
     """
 
-    def __init__(self, data_dir, is_training=True, val_split=0.2, random_state=42, augment: bool=False):
+    def __init__(self, data_dir, is_training=True, val_split=0.2, random_state=42, augment: bool=False, global_stats=None):
         super().__init__()
         self.data_dir = data_dir
         self.is_training = is_training
         self.augment = augment
+        self.global_stats = global_stats
 
         # Band dirs
         self.band_dirs = []
@@ -273,7 +345,8 @@ class GlacierTileDataset(Dataset):
             # Clean NaN/Inf
             if np.isnan(arr).any() or np.isinf(arr).any():
                 arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-            arr = normalize_band(arr)
+            band_stats = self.global_stats.get(b) if self.global_stats else None
+            arr = normalize_band(arr, band_stats)
             bands.append(arr)
 
         # Assert all bands share the same shape
@@ -324,10 +397,14 @@ class GlacierTileDataset(Dataset):
         return torch.from_numpy(x), torch.from_numpy(y)
 
 
-def create_segmentation_dataloaders(data_dir, batch_size=2, val_split=0.2, num_workers=2, augment: bool=False):
+def create_segmentation_dataloaders(data_dir, batch_size=2, val_split=0.2, num_workers=2, augment: bool=False, use_global_stats=False):
     """Create dataloaders for segmentation models operating on full tiles."""
-    train_dataset = GlacierTileDataset(data_dir, is_training=True, val_split=val_split, augment=augment)
-    val_dataset = GlacierTileDataset(data_dir, is_training=False, val_split=val_split, augment=False)
+    global_stats = None
+    if use_global_stats:
+        global_stats = compute_global_stats(data_dir, sample_ratio=0.1)
+    
+    train_dataset = GlacierTileDataset(data_dir, is_training=True, val_split=val_split, augment=augment, global_stats=global_stats)
+    val_dataset = GlacierTileDataset(data_dir, is_training=False, val_split=val_split, augment=False, global_stats=global_stats)
 
     train_loader = DataLoader(
         train_dataset,

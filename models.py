@@ -1,6 +1,74 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
+
+# EfficientNet-style building blocks
+class MBConvBlock(nn.Module):
+    """Mobile Inverted Bottleneck Conv Block with SE attention."""
+    
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, expand_ratio=6, se_ratio=0.25, drop_rate=0.0):
+        super().__init__()
+        self.stride = stride
+        self.drop_rate = drop_rate
+        self.use_residual = stride == 1 and in_channels == out_channels
+        
+        # Expansion phase
+        expanded_channels = in_channels * expand_ratio
+        self.expand_conv = nn.Sequential(
+            nn.Conv2d(in_channels, expanded_channels, 1, bias=False),
+            nn.BatchNorm2d(expanded_channels),
+            nn.SiLU(inplace=True)
+        ) if expand_ratio != 1 else nn.Identity()
+        
+        # Depthwise conv
+        self.depthwise_conv = nn.Sequential(
+            nn.Conv2d(expanded_channels, expanded_channels, kernel_size, stride, 
+                     padding=kernel_size//2, groups=expanded_channels, bias=False),
+            nn.BatchNorm2d(expanded_channels),
+            nn.SiLU(inplace=True)
+        )
+        
+        # Squeeze-and-Excitation
+        se_channels = max(1, int(in_channels * se_ratio))
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(expanded_channels, se_channels, 1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(se_channels, expanded_channels, 1),
+            nn.Sigmoid()
+        )
+        
+        # Output projection
+        self.project_conv = nn.Sequential(
+            nn.Conv2d(expanded_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels)
+        )
+        
+        # Stochastic depth
+        self.drop_path = nn.Dropout2d(drop_rate) if drop_rate > 0 else nn.Identity()
+    
+    def forward(self, x):
+        identity = x
+        
+        # Expansion
+        x = self.expand_conv(x)
+        
+        # Depthwise conv
+        x = self.depthwise_conv(x)
+        
+        # SE attention
+        se_weights = self.se(x)
+        x = x * se_weights
+        
+        # Output projection
+        x = self.project_conv(x)
+        
+        # Stochastic depth + residual
+        if self.use_residual:
+            x = self.drop_path(x) + identity
+        
+        return x
 
 class PixelANN(nn.Module):
     """Simple pixel-wise ANN for glacier segmentation."""
@@ -26,6 +94,141 @@ class PixelANN(nn.Module):
         
     def forward(self, x):
         return self.net(x)
+
+class EfficientUNet(nn.Module):
+    """Efficient U-Net with MBConv blocks and attention."""
+    
+    def __init__(self, in_channels=5, out_channels=1, width_mult=1.0):
+        super().__init__()
+        
+        # Calculate channel dimensions
+        def make_divisible(v, divisor=8):
+            return max(divisor, int(v + divisor / 2) // divisor * divisor)
+        
+        channels = [make_divisible(c * width_mult) for c in [32, 64, 128, 256, 512]]
+        
+        # Stem
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, channels[0], 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels[0]),
+            nn.SiLU(inplace=True)
+        )
+        
+        # Encoder - EfficientNet-style blocks
+        self.enc1 = nn.Sequential(
+            MBConvBlock(channels[0], channels[0], 3, 1, 1, 0.25, 0.1),
+            MBConvBlock(channels[0], channels[1], 3, 2, 6, 0.25, 0.1)
+        )
+        self.enc2 = nn.Sequential(
+            MBConvBlock(channels[1], channels[1], 3, 1, 6, 0.25, 0.1),
+            MBConvBlock(channels[1], channels[2], 3, 2, 6, 0.25, 0.1)
+        )
+        self.enc3 = nn.Sequential(
+            MBConvBlock(channels[2], channels[2], 5, 1, 6, 0.25, 0.2),
+            MBConvBlock(channels[2], channels[3], 5, 2, 6, 0.25, 0.2)
+        )
+        self.enc4 = nn.Sequential(
+            MBConvBlock(channels[3], channels[3], 5, 1, 6, 0.25, 0.2),
+            MBConvBlock(channels[3], channels[4], 3, 2, 6, 0.25, 0.3)
+        )
+        
+        # Bottleneck with attention
+        self.bottleneck = nn.Sequential(
+            MBConvBlock(channels[4], channels[4], 3, 1, 6, 0.25, 0.3),
+            MBConvBlock(channels[4], channels[4], 3, 1, 6, 0.25, 0.3)
+        )
+        
+        # Decoder with feature fusion
+        self.up4 = nn.ConvTranspose2d(channels[4], channels[3], 2, 2)
+        self.dec4 = nn.Sequential(
+            nn.Conv2d(channels[3] * 2, channels[3], 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels[3]),
+            nn.SiLU(inplace=True),
+            MBConvBlock(channels[3], channels[3], 3, 1, 4, 0.25, 0.2)
+        )
+        
+        self.up3 = nn.ConvTranspose2d(channels[3], channels[2], 2, 2)
+        self.dec3 = nn.Sequential(
+            nn.Conv2d(channels[2] * 2, channels[2], 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels[2]),
+            nn.SiLU(inplace=True),
+            MBConvBlock(channels[2], channels[2], 3, 1, 4, 0.25, 0.1)
+        )
+        
+        self.up2 = nn.ConvTranspose2d(channels[2], channels[1], 2, 2)
+        self.dec2 = nn.Sequential(
+            nn.Conv2d(channels[1] * 2, channels[1], 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels[1]),
+            nn.SiLU(inplace=True),
+            MBConvBlock(channels[1], channels[1], 3, 1, 4, 0.25, 0.1)
+        )
+        
+        self.up1 = nn.ConvTranspose2d(channels[1], channels[0], 2, 2)
+        self.dec1 = nn.Sequential(
+            nn.Conv2d(channels[0] * 2, channels[0], 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels[0]),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channels[0], channels[0], 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels[0]),
+            nn.SiLU(inplace=True)
+        )
+        
+        # Final prediction head with deep supervision
+        self.final = nn.Sequential(
+            nn.Conv2d(channels[0], channels[0] // 2, 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels[0] // 2),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channels[0] // 2, out_channels, 1)
+        )
+        
+        # Deep supervision heads
+        self.aux_head4 = nn.Conv2d(channels[3], out_channels, 1)
+        self.aux_head3 = nn.Conv2d(channels[2], out_channels, 1)
+        
+    def forward(self, x, deep_supervision=False):
+        input_size = x.shape[-2:]
+        
+        # Encoder
+        x0 = self.stem(x)
+        x1 = self.enc1(x0)  # 1/2
+        x2 = self.enc2(x1)  # 1/4  
+        x3 = self.enc3(x2)  # 1/8
+        x4 = self.enc4(x3)  # 1/16
+        
+        # Bottleneck
+        x = self.bottleneck(x4)
+        
+        # Decoder
+        x = self.up4(x)
+        x = torch.cat([x, x4], dim=1)
+        x = self.dec4(x)
+        
+        aux4 = None
+        if deep_supervision:
+            aux4 = torch.sigmoid(F.interpolate(self.aux_head4(x), input_size, mode='bilinear', align_corners=False))
+        
+        x = self.up3(x)
+        x = torch.cat([x, x3], dim=1) 
+        x = self.dec3(x)
+        
+        aux3 = None
+        if deep_supervision:
+            aux3 = torch.sigmoid(F.interpolate(self.aux_head3(x), input_size, mode='bilinear', align_corners=False))
+        
+        x = self.up2(x)
+        x = torch.cat([x, x2], dim=1)
+        x = self.dec2(x)
+        
+        x = self.up1(x)
+        x = torch.cat([x, x1], dim=1)
+        x = self.dec1(x)
+        
+        # Final prediction
+        out = torch.sigmoid(self.final(x))
+        
+        if deep_supervision:
+            return out, aux4, aux3
+        return out
 
 class UNet(nn.Module):
     """U-Net model for semantic segmentation of satellite imagery."""

@@ -135,6 +135,100 @@ class WeightedBCELoss(nn.Module):
         loss = loss_pos + loss_neg
         return loss.mean()
 
+class TverskyLoss(nn.Module):
+    """Tversky Loss - better for imbalanced segmentation than Dice."""
+    def __init__(self, alpha=0.7, beta=0.3, smooth=1e-6):
+        super(TverskyLoss, self).__init__()
+        self.alpha = alpha  # False positive penalty
+        self.beta = beta    # False negative penalty
+        self.smooth = smooth
+
+    def forward(self, y_pred, y_true):
+        y_true_pos = y_true.view(-1)
+        y_pred_pos = y_pred.view(-1)
+        
+        true_pos = (y_true_pos * y_pred_pos).sum()
+        false_neg = (y_true_pos * (1 - y_pred_pos)).sum()
+        false_pos = ((1 - y_true_pos) * y_pred_pos).sum()
+        
+        tversky = (true_pos + self.smooth) / (
+            true_pos + self.alpha * false_pos + self.beta * false_neg + self.smooth
+        )
+        return 1 - tversky
+
+class BoundaryLoss(nn.Module):
+    """Boundary-aware loss that emphasizes glacier edges."""
+    def __init__(self, theta0=3, theta=5):
+        super(BoundaryLoss, self).__init__()
+        self.theta0 = theta0
+        self.theta = theta
+
+    def forward(self, y_pred, y_true):
+        """
+        y_pred: [N, 1, H, W] or [N, H, W]
+        y_true: [N, 1, H, W] or [N, H, W] 
+        """
+        if y_pred.dim() == 4:
+            y_pred = y_pred.squeeze(1)
+        if y_true.dim() == 4:
+            y_true = y_true.squeeze(1)
+            
+        # Compute distance transform for boundaries
+        boundary_weight = self._compute_boundary_weight(y_true)
+        
+        # Standard BCE with boundary weighting
+        eps = 1e-6
+        y_pred = torch.clamp(y_pred, eps, 1.0 - eps)
+        bce = -(y_true * torch.log(y_pred) + (1 - y_true) * torch.log(1 - y_pred))
+        
+        return (bce * boundary_weight).mean()
+
+    def _compute_boundary_weight(self, y_true):
+        """Compute boundary-aware weights."""
+        # Simple boundary detection using gradients
+        device = y_true.device
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=device).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=device).view(1, 1, 3, 3)
+        
+        y_true_expanded = y_true.unsqueeze(1).float()
+        
+        grad_x = torch.nn.functional.conv2d(y_true_expanded, sobel_x, padding=1)
+        grad_y = torch.nn.functional.conv2d(y_true_expanded, sobel_y, padding=1)
+        
+        grad_magnitude = torch.sqrt(grad_x**2 + grad_y**2).squeeze(1)
+        
+        # Create boundary weight: higher weight near boundaries
+        boundary_weight = 1.0 + self.theta * torch.sigmoid(self.theta0 * grad_magnitude)
+        
+        return boundary_weight
+
+class AdaptiveLoss(nn.Module):
+    """Adaptive loss that combines multiple losses with learned weights."""
+    def __init__(self):
+        super(AdaptiveLoss, self).__init__()
+        self.bce = nn.BCELoss()
+        self.dice = DiceLoss()
+        self.tversky = TverskyLoss(alpha=0.7, beta=0.3)
+        
+        # Learnable loss weights
+        self.log_vars = nn.Parameter(torch.zeros(3))
+
+    def forward(self, y_pred, y_true):
+        bce_loss = self.bce(y_pred, y_true)
+        dice_loss = self.dice(y_pred, y_true)
+        tversky_loss = self.tversky(y_pred, y_true)
+        
+        # Multi-task learning uncertainty weighting
+        precision1 = torch.exp(-self.log_vars[0])
+        precision2 = torch.exp(-self.log_vars[1])
+        precision3 = torch.exp(-self.log_vars[2])
+        
+        loss = precision1 * bce_loss + self.log_vars[0] + \
+               precision2 * dice_loss + self.log_vars[1] + \
+               precision3 * tversky_loss + self.log_vars[2]
+        
+        return loss
+
 def _compute_metrics_from_logits(outputs, targets):
     # outputs and targets can be (N,1) or (N,1,H,W) or (N,H,W)
     with torch.no_grad():

@@ -1,23 +1,34 @@
-# pip install torch torchvision numpy pillow tifffile segmentation-models-pytorch albumentations ttach
+# pip install torch torchvision numpy pillow tifffile scikit-learn tqdm
 
 import os
 import re
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 import tifffile
 
-from models import UNet
+from models import UNet, EfficientUNet, DeepLabV3Plus
 
 # --- Model Definition ---
 
 def get_model():
-    model = UNet(
-        in_channels=5,
-        out_channels=1,
-    )
+    # Environment-based model selection
+    model_type = os.environ.get("SOLUTION_MODEL", "unet").lower()
+    
+    if model_type == "efficient_unet":
+        model = EfficientUNet(
+            in_channels=5,
+            out_channels=1,
+            width_mult=1.0
+        )
+    else:  # default to unet
+        model = UNet(
+            in_channels=5,
+            out_channels=1,
+        )
     return model
 
 # --- Dataset Definition ---
@@ -107,7 +118,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", required=True, help="Path to test images folder")
     parser.add_argument("--masks", required=True, help="Path to masks folder (unused)")
-    parser.add_argument("--output", required=True, help="Path to output predictions")
+    parser.add_argument("--out", required=True, help="Path to output predictions")
     args = parser.parse_args()
 
     # Build band → folder map
@@ -120,7 +131,7 @@ def main():
     print(f"Processing bands: {list(imagepath.keys())}")
 
     # Run mask generation and save predictions
-    maskgeration(imagepath, args.output)
+    maskgeration(imagepath, args.out)
 
 if __name__ == "__main__":
     main()

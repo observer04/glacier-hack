@@ -6,8 +6,8 @@ import torch.optim as optim
 
 # Import our modules
 from data_utils import create_dataloaders, create_segmentation_dataloaders
-from models import PixelANN, UNet, DeepLabV3Plus
-from train_utils import train_model, CombinedLoss, FocalLoss, DiceLoss, WeightedBCELoss, collect_validation_probs
+from models import PixelANN, UNet, DeepLabV3Plus, EfficientUNet
+from train_utils import train_model, CombinedLoss, FocalLoss, DiceLoss, WeightedBCELoss, TverskyLoss, BoundaryLoss, AdaptiveLoss, collect_validation_probs
 import random
 import numpy as np
 
@@ -32,6 +32,7 @@ def main(args):
             batch_size=args.batch_size,
             val_split=args.val_split,
             num_workers=args.num_workers,
+            use_global_stats=args.global_stats,
         )
     else:
         # For segmentation models, batch size is per tile; default smaller
@@ -41,6 +42,7 @@ def main(args):
             batch_size=seg_batch,
             val_split=args.val_split,
             num_workers=args.num_workers,
+            use_global_stats=args.global_stats,
             augment=args.augment,
         )
     
@@ -55,39 +57,33 @@ def main(args):
         model = UNet(in_channels=5, out_channels=1)
     elif args.model_type == "deeplabv3plus":
         model = DeepLabV3Plus(in_channels=5, out_channels=1)
+    elif args.model_type == "efficient_unet":
+        model = EfficientUNet(
+            in_channels=5, 
+            out_channels=1,
+            width_mult=1.0  # Can be tuned for model size/performance trade-off
+        )
     else:
         raise ValueError(f"Unknown model type: {args.model_type}")
     
     print(f"Model created: {args.model_type}")
     
     # Define loss function
-    if args.model_type == "pixelann":
-        if args.loss == "bce":
-            criterion = nn.BCELoss()
-        elif args.loss == "wbce":
-            criterion = WeightedBCELoss(pos_weight=args.pos_weight)
-        elif args.loss == "focal":
-            criterion = FocalLoss(alpha=args.focal_alpha, gamma=args.focal_gamma)
-        elif args.loss == "dice":
-            criterion = DiceLoss()
-        elif args.loss == "combined":
-            criterion = CombinedLoss(alpha=args.combined_alpha, beta=args.combined_beta)
-        else:
-            raise ValueError(f"Unknown loss function: {args.loss}")
-    else:
-        # Segmentation models support the same family of losses
-        if args.loss == "bce":
-            criterion = nn.BCELoss()
-        elif args.loss == "wbce":
-            criterion = WeightedBCELoss(pos_weight=args.pos_weight)
-        elif args.loss == "focal":
-            criterion = FocalLoss(alpha=args.focal_alpha, gamma=args.focal_gamma)
-        elif args.loss == "dice":
-            criterion = DiceLoss()
-        elif args.loss == "combined":
-            criterion = CombinedLoss(alpha=args.combined_alpha, beta=args.combined_beta)
-        else:
-            raise ValueError(f"Unknown loss function: {args.loss}")
+    loss_functions = {
+        "bce": nn.BCELoss(),
+        "wbce": WeightedBCELoss(pos_weight=args.pos_weight),
+        "focal": FocalLoss(alpha=args.focal_alpha, gamma=args.focal_gamma),
+        "dice": DiceLoss(),
+        "combined": CombinedLoss(alpha=args.combined_alpha, beta=args.combined_beta),
+        "tversky": TverskyLoss(alpha=args.tversky_alpha, beta=args.tversky_beta),
+        "boundary": BoundaryLoss(),
+        "adaptive": AdaptiveLoss()
+    }
+    
+    if args.loss not in loss_functions:
+        raise ValueError(f"Unknown loss function: {args.loss}")
+    
+    criterion = loss_functions[args.loss]
     
     # Define optimizer
     if args.optimizer == "adam":
@@ -175,7 +171,7 @@ if __name__ == "__main__":
     parser.add_argument("--val_split", type=float, default=0.2, help="Validation split ratio")
     
     # Model parameters
-    parser.add_argument("--model_type", type=str, default="pixelann", choices=["pixelann", "unet", "deeplabv3plus"], help="Type of model to train")
+    parser.add_argument("--model_type", type=str, default="pixelann", choices=["pixelann", "unet", "deeplabv3plus", "efficient_unet"], help="Type of model to train")
     parser.add_argument("--dropout_rate", type=float, default=0.2, help="Dropout rate for PixelANN")
     
     # Training parameters
@@ -183,12 +179,14 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=50, help="Number of epochs to train")
     parser.add_argument("--learning_rate", type=float, default=0.001, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-5, help="Weight decay for optimizer")
-    parser.add_argument("--loss", type=str, default="bce", choices=["bce", "wbce", "focal", "dice", "combined"], help="Loss function")
+    parser.add_argument("--loss", type=str, default="bce", choices=["bce", "wbce", "focal", "dice", "combined", "tversky", "boundary", "adaptive"], help="Loss function")
     parser.add_argument("--pos_weight", type=float, default=1.0, help="Positive class weight for WBCE")
     parser.add_argument("--focal_alpha", type=float, default=0.25, help="Focal loss alpha")
     parser.add_argument("--focal_gamma", type=float, default=2.0, help="Focal loss gamma")
     parser.add_argument("--combined_alpha", type=float, default=0.5, help="Weight for BCE part in CombinedLoss")
     parser.add_argument("--combined_beta", type=float, default=0.5, help="Weight for Dice part in CombinedLoss")
+    parser.add_argument("--tversky_alpha", type=float, default=0.7, help="False positive penalty for Tversky loss")
+    parser.add_argument("--tversky_beta", type=float, default=0.3, help="False negative penalty for Tversky loss")
     parser.add_argument("--optimizer", type=str, default="adam", choices=["adam", "sgd"], help="Optimizer")
     parser.add_argument("--scheduler", type=str, default="plateau", choices=["plateau", "cosine", "none"], help="Learning rate scheduler")
     parser.add_argument("--early_stopping_patience", type=int, default=10, help="Patience for early stopping")
@@ -199,6 +197,7 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_interval", type=int, default=0, help="Save intermediate checkpoints every N epochs (0 to disable)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--threshold_sweep", action="store_true", help="Run threshold sweep on validation set after training")
+    parser.add_argument("--global_stats", action="store_true", help="Use global normalization statistics instead of per-tile")
     
     # System parameters
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"], help="Device to use")

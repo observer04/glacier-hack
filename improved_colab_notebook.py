@@ -21,39 +21,143 @@ from sklearn.metrics import matthews_corrcoef
 from sklearn.model_selection import train_test_split
 import torchvision.transforms as transforms
 
-from models import UNet
-from data_utils import GlacierTileDataset, normalize_band, get_tile_id
-from train_utils import DiceLoss, CombinedLoss
 
-model_name = "custom_unet_scratch_loss-0.2bce-0.8dice"
-model_save_path = f"/content/drive/MyDrive/glacier_hack/{model_name}_best_model.pth"
 
-# 2. Data Loading and Augmentation
+# Helper functions from data_utils.py
+def _find_label_path(label_dir: str, tile_id: str):
+    """Return the first existing label path for a tile id among known patterns."""
+    candidates = [
+        os.path.join(label_dir, f"Y{tile_id}.tif"),
+        os.path.join(label_dir, f"Y_output_resized_{tile_id}.tif"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
 
-# Define the augmentations
-train_transforms = transforms.Compose([
-    transforms.RandomHorizontalFlip(p=0.5),
-    transforms.RandomVerticalFlip(p=0.5),
-    transforms.RandomRotation(degrees=90), # RandomRotate90 is not directly available in torchvision
-    transforms.ToTensor(),
-    transforms.Normalize(mean=(0.5, 0.5, 0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5, 0.5, 0.5)),
-])
+def get_tile_id(filename):
+    """Extract tile ID from filename."""
+    match = re.search(r"img(\d+)\\.tif", filename)
+    if match:
+        return match.group(1)
+    
+    match = re.search(r"(\d{2}_\d{2})", filename)
+    return match.group(1) if match else None
 
-val_transforms = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize(mean=(0.5, 0.5, 0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5, 0.5, 0.5)),
-])
+def normalize_band(band):
+    """Normalize a single band using mean and std."""
+    band = band.astype(np.float32)
+    mean = np.mean(band)
+    std = np.std(band)
+    if std > 0:
+        return (band - mean) / std
+    return band
 
-# Create the datasets and dataloaders
-# NOTE: You will need to upload your 'Train' directory to your Colab environment
-# or mount your Google Drive if the data is there.
-data_dir = "./Train"
+# --- Dataset Definition ---
 
-train_dataset = GlacierTileDataset(data_dir, is_training=True, augment=True)
-val_dataset = GlacierTileDataset(data_dir, is_training=False, augment=False)
+class GlacierTileDataset(Dataset):
+    """Dataset that returns full 5-band tiles and masks for segmentation models.
 
-train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=0, drop_last=True)
-val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=0)
+    Returns:
+      - X: FloatTensor of shape (5, H, W)
+      - y: FloatTensor of shape (H, W) with values {0,1}
+    """
+
+    def __init__(self, data_dir, is_training=True, val_split=0.2, random_state=42, augment: bool=False):
+        super().__init__()
+        self.data_dir = data_dir
+        self.is_training = is_training
+        self.augment = augment
+
+        # Band dirs
+        self.band_dirs = []
+        for i in range(1, 6):
+            band_dir = os.path.join(data_dir, f"Band{i}")
+            if not os.path.exists(band_dir):
+                raise ValueError(f"Band{i} directory not found in {data_dir}")
+            self.band_dirs.append(band_dir)
+
+        # Label dir
+        self.label_dir = os.path.join(data_dir, "label")
+        if not os.path.exists(self.label_dir):
+            raise ValueError(f"Label directory not found in {data_dir}")
+
+        # Map band -> tile_id -> filename
+        self.band_tile_map = {i: {} for i in range(5)}
+        all_ids = set()
+        for band_idx, band_dir in enumerate(self.band_dirs):
+            for f in os.listdir(band_dir):
+                if not f.endswith(".tif"):
+                    continue
+                tile_id = get_tile_id(f)
+                if tile_id:
+                    self.band_tile_map[band_idx][tile_id] = f
+                    all_ids.add(tile_id)
+
+        # Keep only tiles present in all bands with a matching label file
+        self.valid_tile_ids = []
+        for tid in all_ids:
+            all_bands = all(tid in self.band_tile_map[b] for b in range(5))
+            label_exists = _find_label_path(self.label_dir, tid) is not None
+            if all_bands and label_exists:
+                self.valid_tile_ids.append(tid)
+
+        train_ids, val_ids = train_test_split(self.valid_tile_ids, test_size=val_split, random_state=42)
+        self.tile_ids = train_ids if is_training else val_ids
+        print(f"{'Training' if is_training else 'Validation'} tile dataset with {len(self.tile_ids)} tiles")
+
+    def __len__(self):
+        return len(self.tile_ids)
+
+    def __getitem__(self, index: int):
+        tid = self.tile_ids[index]
+        bands = []
+        H = W = None
+        for b in range(5):
+            fp = os.path.join(self.band_dirs[b], self.band_tile_map[b][tid])
+            arr = np.array(Image.open(fp))
+            if arr.ndim == 3:
+                arr = arr[..., 0]
+            H, W = arr.shape
+            # Clean NaN/Inf
+            if np.isnan(arr).any() or np.isinf(arr).any():
+                arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+            arr = normalize_band(arr)
+            bands.append(arr)
+
+        # Assert all bands share the same shape
+        for k in range(1, len(bands)):
+            if bands[k].shape != bands[0].shape:
+                raise ValueError(f"Band shape mismatch for tile {tid}: {bands[k].shape} vs {bands[0].shape}")
+
+        x = np.stack(bands, axis=0).astype(np.float32)  # (5, H, W)
+
+        label_path = _find_label_path(self.label_dir, tid)
+        if label_path is None:
+            raise FileNotFoundError(f"Label not found for tile {tid} in {self.label_dir}")
+        y = np.array(Image.open(label_path))
+        if y.ndim == 3:
+            y = y[..., 0]
+        if np.isnan(y).any() or np.isinf(y).any():
+            y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+        y = (y > 0).astype(np.float32)  # (H, W)
+
+        # Simple augmentations for training
+        if self.is_training and self.augment:
+            # Geometric flips
+            if np.random.rand() < 0.5:
+                x = np.flip(x, axis=2).copy()
+                y = np.flip(y, axis=1).copy()
+            if np.random.rand() < 0.5:
+                x = np.flip(x, axis=1).copy()
+                y = np.flip(y, axis=0).copy()
+            # Random 90 deg rotation
+            k = np.random.randint(0, 4)
+            if k:
+                x = np.rot90(x, k=k, axes=(1, 2)).copy()
+                y = np.rot90(y, k=k, axes=(0, 1)).copy()
+
+        return torch.from_numpy(x), torch.from_numpy(y)
 
 # 3. Model Definition
 
@@ -66,7 +170,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
 
 # Define the loss function and optimizer
-criterion = CombinedLoss(alpha=0.2, beta=0.8) # Use CombinedLoss from train_utils.py
+criterion = nn.BCELoss()
 
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
@@ -110,6 +214,7 @@ for epoch in range(epochs):
         for images, masks in tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]"):
             images, masks = images.to(device), masks.to(device)
             outputs = model(images)
+            print(f"Outputs shape before loss in validation: {outputs.shape}")
             
             loss = criterion(outputs, masks.unsqueeze(1)) # Add channel dimension to masks
 
