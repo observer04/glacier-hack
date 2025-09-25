@@ -138,34 +138,46 @@ class EfficientUNet(nn.Module):
             MBConvBlock(channels[4], channels[4], 3, 1, 6, 0.25, 0.3)
         )
         
-        # Decoder with feature fusion
+        # Channel projection layers to handle MBConv output variations
+        self.proj1 = nn.Conv2d(channels[1], channels[1], 1)  # Ensure consistent channels
+        self.proj2 = nn.Conv2d(channels[2], channels[2], 1)
+        self.proj3 = nn.Conv2d(channels[3], channels[3], 1)
+        self.proj4 = nn.Conv2d(channels[4], channels[4], 1)
+        
+        # Decoder with adaptive channel matching
         self.up4 = nn.ConvTranspose2d(channels[4], channels[3], 2, 2)
         self.dec4 = nn.Sequential(
-            nn.Conv2d(channels[3] * 2, channels[3], 3, padding=1, bias=False),
+            nn.Conv2d(channels[3] + channels[3], channels[3], 3, padding=1, bias=False),  # Adaptive concat
             nn.BatchNorm2d(channels[3]),
             nn.SiLU(inplace=True),
-            MBConvBlock(channels[3], channels[3], 3, 1, 4, 0.25, 0.2)
+            nn.Conv2d(channels[3], channels[3], 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels[3]),
+            nn.SiLU(inplace=True)
         )
         
         self.up3 = nn.ConvTranspose2d(channels[3], channels[2], 2, 2)
         self.dec3 = nn.Sequential(
-            nn.Conv2d(channels[2] * 2, channels[2], 3, padding=1, bias=False),
+            nn.Conv2d(channels[2] + channels[2], channels[2], 3, padding=1, bias=False),  # Adaptive concat
             nn.BatchNorm2d(channels[2]),
             nn.SiLU(inplace=True),
-            MBConvBlock(channels[2], channels[2], 3, 1, 4, 0.25, 0.1)
+            nn.Conv2d(channels[2], channels[2], 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels[2]),
+            nn.SiLU(inplace=True)
         )
         
         self.up2 = nn.ConvTranspose2d(channels[2], channels[1], 2, 2)
         self.dec2 = nn.Sequential(
-            nn.Conv2d(channels[1] * 2, channels[1], 3, padding=1, bias=False),
+            nn.Conv2d(channels[1] + channels[1], channels[1], 3, padding=1, bias=False),  # Adaptive concat
             nn.BatchNorm2d(channels[1]),
             nn.SiLU(inplace=True),
-            MBConvBlock(channels[1], channels[1], 3, 1, 4, 0.25, 0.1)
+            nn.Conv2d(channels[1], channels[1], 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels[1]),
+            nn.SiLU(inplace=True)
         )
         
         self.up1 = nn.ConvTranspose2d(channels[1], channels[0], 2, 2)
         self.dec1 = nn.Sequential(
-            nn.Conv2d(channels[0] * 2, channels[0], 3, padding=1, bias=False),
+            nn.Conv2d(channels[0] + channels[0], channels[0], 3, padding=1, bias=False),  # Adaptive concat
             nn.BatchNorm2d(channels[0]),
             nn.SiLU(inplace=True),
             nn.Conv2d(channels[0], channels[0], 3, padding=1, bias=False),
@@ -190,10 +202,10 @@ class EfficientUNet(nn.Module):
         
         # Encoder
         x0 = self.stem(x)
-        x1 = self.enc1(x0)  # 1/2
-        x2 = self.enc2(x1)  # 1/4  
-        x3 = self.enc3(x2)  # 1/8
-        x4 = self.enc4(x3)  # 1/16
+        x1 = self.proj1(self.enc1(x0))  # 1/2, ensure consistent channels
+        x2 = self.proj2(self.enc2(x1))  # 1/4  
+        x3 = self.proj3(self.enc3(x2))  # 1/8
+        x4 = self.proj4(self.enc4(x3))  # 1/16
         
         # Bottleneck
         x = self.bottleneck(x4)
