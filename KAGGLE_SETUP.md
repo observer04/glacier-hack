@@ -1,6 +1,6 @@
 # Kaggle Notebook Setup for Glacier Hack
 
-## Cell 1: Initial Setup and Data Download
+## Cell 1: Initial Setup and Google Drive Mount
 ```python
 import os
 import subprocess
@@ -13,6 +13,14 @@ print(f"CUDA available: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+
+# Mount Google Drive
+from google.colab import drive
+drive.mount('/content/drive')
+
+# Create project directory in Google Drive
+os.makedirs('/content/drive/MyDrive/glacier_hack', exist_ok=True)
+print("✅ Google Drive mounted and project directory created!")
 
 # Set working directory
 os.chdir('/kaggle/working')
