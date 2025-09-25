@@ -57,7 +57,7 @@ def main(args):
         model = UNet(in_channels=5, out_channels=1)
     elif args.model_type == "deeplabv3plus":
         model = DeepLabV3Plus(in_channels=5, out_channels=1)
-    elif args.model_type == "efficient_unet":
+    elif args.model_type in ["efficient_unet", "efficientunet"]:
         model = EfficientUNet(
             in_channels=5, 
             out_channels=1,
@@ -171,7 +171,7 @@ if __name__ == "__main__":
     parser.add_argument("--val_split", type=float, default=0.2, help="Validation split ratio")
     
     # Model parameters
-    parser.add_argument("--model_type", type=str, default="pixelann", choices=["pixelann", "unet", "deeplabv3plus", "efficient_unet"], help="Type of model to train")
+    parser.add_argument("--model_type", type=str, default="pixelann", choices=["pixelann", "unet", "deeplabv3plus", "efficient_unet", "efficientunet"], help="Type of model to train")
     parser.add_argument("--dropout_rate", type=float, default=0.2, help="Dropout rate for PixelANN")
     
     # Training parameters

@@ -21,7 +21,7 @@ python train_model.py \
   --grad_clip 1.0 \
   --global_stats \
   --threshold_sweep \
-  --model_save_path "./models/efficientunet_tversky"
+  --model_save_path "/content/drive/MyDrive/glacier_hack/models/efficientunet_tversky"
 ```
 
 ### EfficientUNet + Boundary Loss (For edge-aware segmentation)
@@ -40,7 +40,7 @@ python train_model.py \
   --grad_clip 1.0 \
   --global_stats \
   --threshold_sweep \
-  --model_save_path "./models/efficientunet_boundary"
+  --model_save_path "/content/drive/MyDrive/glacier_hack/models/efficientunet_boundary"
 ```
 
 ### UNet + Adaptive Loss (Multi-loss learning)
@@ -59,7 +59,7 @@ python train_model.py \
   --grad_clip 1.0 \
   --global_stats \
   --threshold_sweep \
-  --model_save_path "./models/unet_adaptive"
+  --model_save_path "/content/drive/MyDrive/glacier_hack/models/unet_adaptive"
 ```
 
 ## 2. MULTI-SCALE TRAINING (Advanced - 78+ MCC Target)
@@ -81,7 +81,7 @@ python train_multiscale.py \
   --amp \
   --grad_clip 1.0 \
   --early_stopping_patience 15 \
-  --model_save_path "./models/multiscale_efficientunet"
+  --model_save_path "/content/drive/MyDrive/glacier_hack/models/multiscale_efficientunet"
 ```
 
 ## 3. ENSEMBLE TRAINING (Maximum Performance - 80+ MCC Target)
@@ -94,7 +94,7 @@ python train_ensemble.py \
   --num_models 3 \
   --val_split 0.2 \
   --num_workers 2 \
-  --model_save_path "./models/ensemble_full"
+  --model_save_path "/content/drive/MyDrive/glacier_hack/models/ensemble_full"
 ```
 
 ### Quick ensemble with 2 models (faster)
@@ -105,7 +105,7 @@ python train_ensemble.py \
   --num_models 2 \
   --val_split 0.2 \
   --num_workers 2 \
-  --model_save_path "./models/ensemble_quick"
+  --model_save_path "/content/drive/MyDrive/glacier_hack/models/ensemble_quick"
 ```
 
 ## 4. EVALUATION COMMANDS
@@ -114,7 +114,7 @@ python train_ensemble.py \
 ```bash
 python evaluate_model.py \
   --data_dir "/content/Train" \
-  --model_path "./models/efficientunet_tversky/efficientunet_best.pth" \
+  --model_path "/content/drive/MyDrive/glacier_hack/models/efficientunet_tversky/efficientunet_best.pth" \
   --model_type efficientunet \
   --tta \
   --batch_size 4
@@ -124,7 +124,7 @@ python evaluate_model.py \
 ```bash
 python evaluate_model.py \
   --data_dir "/content/Train" \
-  --model_path "./models/efficientunet_tversky/efficientunet_best.pth" \
+  --model_path "/content/drive/MyDrive/glacier_hack/models/efficientunet_tversky/efficientunet_best.pth" \
   --model_type efficientunet \
   --threshold_sweep \
   --batch_size 4
@@ -133,11 +133,26 @@ python evaluate_model.py \
 ## 5. COLAB SETUP (Run first in your Colab)
 
 ```python
+# Mount Google Drive
+from google.colab import drive
+drive.mount('/content/drive')
+
+# Create project directory in Google Drive
+import os
+os.makedirs('/content/drive/MyDrive/glacier_hack', exist_ok=True)
+os.chdir('/content/drive/MyDrive/glacier_hack')
+
 # Install dependencies
 !pip install tqdm scikit-learn matplotlib pillow
 
-# Git pull latest changes
-!cd /content && git pull origin main
+# Clone or update repository
+if not os.path.exists('glacier-hack'):
+    !git clone https://github.com/YOUR_USERNAME/glacier-hack.git
+else:
+    !cd glacier-hack && git pull origin main
+
+# Change to project directory
+os.chdir('glacier-hack')
 
 # Check GPU
 import torch
@@ -145,7 +160,6 @@ print(f"CUDA available: {torch.cuda.is_available()}")
 print(f"GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'None'}")
 
 # Set data path
-import os
 if os.path.exists('/content/Train'):
     print("Training data found!")
 else:
@@ -199,12 +213,68 @@ else:
 
 ## 9. SUBMISSION PREPARATION
 
-After training, your best model will be saved. Use the solution.py script for inference:
+### Step 1: Prepare the Final Model (model.pth)
+After training, convert your best model checkpoint to the required format:
 
 ```python
-# Ensure solution.py uses your best model
-# It will automatically detect and load the best available model
-python solution.py  # This generates predictions for submission
+import torch
+import os
+
+# Find your best model (adjust path based on which training you ran)
+best_model_path = "/content/drive/MyDrive/glacier_hack/models/efficientunet_tversky/efficientunet_best.pth"
+
+# Load and extract just the model state dict
+checkpoint = torch.load(best_model_path, map_location='cpu')
+if 'model_state_dict' in checkpoint:
+    model_state = checkpoint['model_state_dict']
+    print(f"Best MCC: {checkpoint.get('best_mcc', 'unknown')}")
+    print(f"Best threshold: {checkpoint.get('best_threshold', 'unknown')}")
+else:
+    model_state = checkpoint
+
+# Save as model.pth for submission
+torch.save(model_state, '/content/drive/MyDrive/glacier_hack/model.pth')
+print("Saved model.pth for submission!")
+
+# Check file size (must be < 200MB)
+size_mb = os.path.getsize('/content/drive/MyDrive/glacier_hack/model.pth') / (1024*1024)
+print(f"Model size: {size_mb:.1f} MB")
 ```
 
-The solution.py script includes TTA and will use the best model from your training runs.
+### Step 2: Copy Solution Files
+```python
+import shutil
+
+# Copy solution.py to submission directory
+shutil.copy('solution.py', '/content/drive/MyDrive/glacier_hack/solution.py')
+
+# Copy required model files for solution.py to work
+shutil.copy('models.py', '/content/drive/MyDrive/glacier_hack/models.py')
+
+print("Submission files ready!")
+print("Files to submit:")
+print("1. /content/drive/MyDrive/glacier_hack/solution.py")
+print("2. /content/drive/MyDrive/glacier_hack/model.pth")
+print("3. /content/drive/MyDrive/glacier_hack/models.py (dependency)")
+```
+
+### Step 3: Test Your Submission Locally
+```python
+# Test that your submission works
+!cd /content/drive/MyDrive/glacier_hack && python solution.py --data /content/Train --masks /content/Train --out /tmp/test_output
+
+# Check if predictions were generated
+import os
+if os.path.exists('/tmp/test_output') and len(os.listdir('/tmp/test_output')) > 0:
+    print(f"✅ SUCCESS! Generated {len(os.listdir('/tmp/test_output'))} predictions")
+else:
+    print("❌ ERROR: No predictions generated")
+```
+
+### Final Submission Checklist:
+- ✅ `solution.py` - Updated with best model loading
+- ✅ `model.pth` - Your trained model weights (< 200MB)
+- ✅ `models.py` - Required dependency file
+- ✅ Test run successful on sample data
+
+**Your submission folder: `/content/drive/MyDrive/glacier_hack/`**
