@@ -198,8 +198,11 @@ class EfficientUNet(nn.Module):
         # Bottleneck
         x = self.bottleneck(x4)
         
-        # Decoder
+        # Decoder with size matching
         x = self.up4(x)
+        # Match spatial dimensions if needed
+        if x.shape[2:] != x4.shape[2:]:
+            x = F.interpolate(x, size=x4.shape[2:], mode='bilinear', align_corners=False)
         x = torch.cat([x, x4], dim=1)
         x = self.dec4(x)
         
@@ -208,6 +211,8 @@ class EfficientUNet(nn.Module):
             aux4 = torch.sigmoid(F.interpolate(self.aux_head4(x), input_size, mode='bilinear', align_corners=False))
         
         x = self.up3(x)
+        if x.shape[2:] != x3.shape[2:]:
+            x = F.interpolate(x, size=x3.shape[2:], mode='bilinear', align_corners=False)
         x = torch.cat([x, x3], dim=1) 
         x = self.dec3(x)
         
@@ -216,10 +221,14 @@ class EfficientUNet(nn.Module):
             aux3 = torch.sigmoid(F.interpolate(self.aux_head3(x), input_size, mode='bilinear', align_corners=False))
         
         x = self.up2(x)
+        if x.shape[2:] != x2.shape[2:]:
+            x = F.interpolate(x, size=x2.shape[2:], mode='bilinear', align_corners=False)
         x = torch.cat([x, x2], dim=1)
         x = self.dec2(x)
         
         x = self.up1(x)
+        if x.shape[2:] != x1.shape[2:]:
+            x = F.interpolate(x, size=x1.shape[2:], mode='bilinear', align_corners=False)
         x = torch.cat([x, x1], dim=1)
         x = self.dec1(x)
         

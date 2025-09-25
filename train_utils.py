@@ -404,7 +404,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer,
                     targets_t = targets.unsqueeze(1).to(device)
                 else:
                     targets_t = targets.to(device)
-                with torch.cuda.amp.autocast():
+                with torch.cuda.amp.autocast(enabled=use_amp):
                     outputs = model(inputs)
                 # Compute loss outside autocast for BCE-style stability (models already output probs)
                 if outputs.dim() == 4 and targets_t.dim() == 3:
