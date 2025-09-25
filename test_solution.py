@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import matthews_corrcoef
 
 # Import solution
-from solution import maskgeration
+from solution1 import maskgeration
 
 def _find_label_path(label_dir: str, tile_id: str):
     candidates = [

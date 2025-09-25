@@ -1,0 +1,186 @@
+Image Segmentation Challenge — Formal Instructions
+Objective
+Develop a model capable of performing semantic segmentation of glaciers in the provided dataset. Your model will be evaluated on a hidden test set using the Matthews Correlation Coefficient (MCC) as the performance metric.
+
+Submission Requirements
+Script (solution.py)
+Your submission must include a Python script named solution.py containing the following function:
+def maskgeration(imagepath, out_dir):
+  # Save the predicted binary mask for each input image
+  # The saved mask filename must match the corresponding input tile name
+The function must take two arguments:
+imagepath: Path to the input dataset.
+out_dir: Path to the directory where the generated binary masks will be saved.
+The function should save the predicted binary mask for each input image with the same filename as the corresponding input image.
+Package Installation: The first 10–15 lines of solution.py must list all additional Python packages required for execution, as comments. Example:
+
+# pip install torch torchvision tqdm opencv-python
+These packages will be automatically installed during evaluation.
+⚠️ Do not modify the main() function in solution.py. If modified, your code will not be executed.
+
+File Paths
+Do not hardcode file paths.
+The script will be executed with:
+--imagepath <path_to_test_dataset> --output <path_to_output_directory>
+Always use these arguments for all file operations.
+Dataset Structure
+The provided test dataset will have the following structure:
+dataset/
+  Band1/
+   img001.tif/
+   img002.tif/
+   ...
+  Band2/
+   img001.tif/
+   img002.tif/
+   ...
+  Band3/
+   img001.tif/
+   img002.tif/
+   ...
+  Band4/
+   img001.tif/
+   img002.tif/
+   ...
+  Band5/
+   img001.tif/
+   img002.tif/
+   ...
+
+Each folder contains .tif files named consistently across all bands.
+Output Mask
+Save generated binary masks in the directory specified by --output.
+Filenames must exactly match those in the Band1/ folder.
+Example:
+Input: dataset/Band1/img001.tif
+Output: <out_dir>/img001.tif
+Model Weights
+Include your trained PyTorch model weights in the submission.
+The weights file must be named model.pth.
+Maximum file size: 200 MB.
+Evaluation Environment
+Python version: 3.9
+PyTorch version: 2.0
+CUDA version: 11.7
+Refer to
+ReadMe.txt
+ for additional coding guidelines and 
+Requirements.txt
+ for the list of pre-installed packages and versions.
+
+✅ Follow these instructions carefully to ensure successful execution and evaluation of your submission
+
+
+######################
+Image Semantic Segmentation for Glacier Analysis
+Image semantic segmentation is the process of partitioning an image into meaningful regions or objects, typically at the pixel level. In the context of IEEE GRSS (Geoscience and Remote Sensing Society), it is applied to areas such as land cover classification, urban mapping, vegetation delineation, and disaster monitoring using satellite or aerial imagery.
+
+A specialized application of image semantic segmentation is glacier semantic segmentation, where the objective is to extract and analyze glacial regions from satellite images. It plays a vital role in understanding and responding to the effects of climate change. It enables precise mapping of glacier extents, which is essential for:
+
+Monitoring glacial retreat
+Estimating freshwater reserves
+Predicting glacial lake outburst floods (GLOFs)
+Accurate semantic segmentation supports policy-making, disaster risk reduction, and long-term environmental monitoring in high-altitude regions.
+
+Mathematical Problem Formulation
+Let X ∈ ℝn₁×n₂×c be a multispectral input image with spatial dimensions n₁ × n₂ and c = 5 spectral channels: B2 (Blue), B3 (Green), B4 (Red), B6 (Short-Wave Infrared - SWIR), and B10 (Thermal Infrared - TIR1).
+
+Let the ground truth mask be represented as:
+
+Y ∈ {0, 1}n₁×n₂
+
+where:
+
+Yi,j = { 1 if pixel (i, j) is a glacier pixel
+0 if pixel (i, j) is a non-glacier pixel or undefined
+
+###########################
+GlacierHack 2025
+YP Activity of IEEE InGARSS 2025
+Phase I Problem Statement
+August 4, 2025
+Problem Statement
+Image semantic segmentation is the process of partitioning an image into meaningful regions or objects,
+typically at the pixel level. In the context of IEEE GRSS (Geoscience and Remote Sensing Society),
+it is applied to areas such as land cover classification, urban mapping, vegetation delineation, and
+disaster monitoring using satellite or aerial imagery.
+A specialized application of image semantic segmentation is glacier semantic segmentation,
+where the objective is to extract and analyze glacial regions from satellite images. It plays a vital role
+in understanding and responding to the effects of climate change. It enables precise mapping of glacier
+extents, which is essential for:
+•Monitoring glacial retreat
+•Estimating freshwater reserves
+•Predicting glacial lake outburst floods (GLOFs)
+Accurate semantic segmentation supports policy-making, disaster risk reduction, and long-term envi-
+ronmental monitoring in high-altitude regions.
+Mathematical Problem Formulation
+Let X ∈Rn1×n2×c be a multispectral input image with spatial dimensions n1 ×n2 and c = 5 spectral
+channels: B2 (Blue), B3 (Green), B4 (Red), B6 (Short-Wave Infrared - SWIR), and B10 (Thermal
+Infrared - TIR1).
+Let the ground truth mask be represented as:
+Y ∈{0, 1}n1×n2
+where:
+Yi,j =
+{
+1 if pixel (i, j) is a glacier pixel
+0 if pixel (i, j) is a non-glacier pixel or undefined
+
+The task is to learn a mapping function:
+f : Rn1×n2×c →{0, 1}n1×n2
+such that:
+f (X) ≈Y
+and glacier pixels are accurately distinguished from non-glacier ones.
+Evaluation Metric: Matthews Correlation Coefficient (MCC)
+The MCC is defined as:
+MCC = T P ·T N −F P ·F N√(T P + F P )(T P + F N )(T N + F P )(T N + F N )
+where:
+•T P : True Positives
+•T N : True Negatives
+•F P : False Positives
+•F N : False Negatives
+Validation Strategy
+After training on one Himalayan glacier region, the model will be validated on an unseen glacier re-
+gion to evaluate generalization performance. This approach ensures the transferability of the semantic
+segmentation method across diverse terrains and supports its application to large-scale glaciological
+studies.
+
+###############
+# pip install torch torchvision tqdm opencv-python pillow scikit-learn numpy tifffile
+
+# All imports here
+import argparse
+import os
+
+def maskgeration(imagepath, out_dir):
+    # Load Your Model Here
+    # model = YourModel()
+    # model.load_state_dict(torch.load("model.pth", map_location="cpu"))
+    # model.eval()
+    
+    # Your Code Here
+    print("Your Code")
+    # Save the binary mask corresponding to each input with the SAME filename as reference band
+
+
+# Do not update this section
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data", required=True, help="Path to test images folder")
+    parser.add_argument("--masks", required=True, help="Path to masks folder (unused)")
+    parser.add_argument("--out", required=True, help="Path to output predictions")
+    args = parser.parse_args()
+
+    # Build band → folder map
+    imagepath = {}
+    for band in os.listdir(args.data):
+        band_path = os.path.join(args.data, band)
+        if os.path.isdir(band_path):
+            imagepath[band] = band_path
+
+    print(f"Processing bands: {list(imagepath.keys())}")
+
+    # Run mask generation and save predictions
+    maskgeration(imagepath, args.out)
+
+if __name__ == "__main__":
+    main()
