@@ -378,7 +378,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer,
         "train_recall": [], "val_recall": []
     }
     
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler(enabled=use_amp)
     swa_model = None
     if use_swa:
         from torch.optim.swa_utils import AveragedModel
@@ -404,7 +404,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer,
                     targets_t = targets.unsqueeze(1).to(device)
                 else:
                     targets_t = targets.to(device)
-                with torch.cuda.amp.autocast(enabled=use_amp):
+                with torch.amp.autocast(device_type=device, enabled=use_amp):
                     outputs = model(inputs)
                 # Compute loss outside autocast for BCE-style stability (models already output probs)
                 if outputs.dim() == 4 and targets_t.dim() == 3:
