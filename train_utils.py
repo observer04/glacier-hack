@@ -1,5 +1,7 @@
-# train_utils.py - High-Performance Version v2
-# Normalization and Augmentation are performed on the GPU and are flag-controlled.
+
+
+# train_utils.py - High-Performance Version v3
+# Uses stable, global statistics for GPU-side normalization.
 
 import os
 import time
@@ -10,22 +12,41 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from sklearn.metrics import matthews_corrcoef, f1_score, precision_score, recall_score
+from sklearn.metrics import matthews_corrcoef
 import random
+import json
 
 # --- GPU-Side Data Processing Functions ---
-def normalize_on_gpu(x: torch.Tensor) -> torch.Tensor:
-    """Normalizes a batch of images on the GPU, channel-wise."""
-    x = x.float()
-    for i in range(x.shape[1]):
-        channel_data = x[:, i, :, :]
-        mean = channel_data.mean()
-        std = channel_data.std()
-        if std > 0:
-            x[:, i, :, :] = (channel_data - mean) / std
+class GlobalNormalizer(nn.Module):
+    """Applies stable normalization using pre-calculated global stats."""
+    def __init__(self, stats_path):
+        super().__init__()
+        try:
+            with open(stats_path, 'r') as f:
+                stats = json.load(f)
+            # Reshape for broadcasting: (C) -> (1, C, 1, 1)
+            self.mean = torch.tensor(stats['mean']).view(1, 5, 1, 1)
+            self.std = torch.tensor(stats['std']).view(1, 5, 1, 1)
+            print(f"Loaded global stats from {stats_path}")
+        except FileNotFoundError:
+            print(f"Warning: stats.json not found at {stats_path}. Using fallback per-batch normalization.")
+            self.mean = None
+            self.std = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.float()
+        if self.mean is not None:
+            # Use global stats
+            self.mean = self.mean.to(x.device)
+            self.std = self.std.to(x.device)
+            return (x - self.mean) / (self.std + 1e-8)
         else:
-            x[:, i, :, :] = channel_data - mean
-    return x
+            # Fallback to per-batch normalization (less stable)
+            for i in range(x.shape[1]):
+                channel_data = x[:, i, :, :]
+                mean, std = channel_data.mean(), channel_data.std()
+                x[:, i, :, :] = (channel_data - mean) / (std + 1e-8)
+            return x
 
 def augment_on_gpu(images: torch.Tensor, masks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Applies random augmentations to a batch of images and masks on the GPU."""
@@ -62,7 +83,7 @@ class TverskyLoss(nn.Module):
         return 1 - (true_pos + self.smooth) / (true_pos + self.alpha * false_pos + self.beta * false_neg + self.smooth)
 
 # --- Core Training & Validation Loops ---
-def train_epoch(model, dataloader, criterion, optimizer, device, accum_steps: int, grad_clip: float, use_amp: bool, augment: bool):
+def train_epoch(model, dataloader, criterion, optimizer, device, normalizer, accum_steps: int, grad_clip: float, use_amp: bool, augment: bool):
     model.train()
     running_loss = 0.0
     all_preds, all_targets = [], []
@@ -73,7 +94,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, accum_steps: in
         inputs = inputs.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
-        inputs = normalize_on_gpu(inputs)
+        inputs = normalizer(inputs)
         if augment:
             inputs, targets = augment_on_gpu(inputs, targets)
 
@@ -100,7 +121,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, accum_steps: in
     mcc = matthews_corrcoef(all_targets, all_preds)
     return running_loss / len(dataloader.dataset), mcc
 
-def validate(model, dataloader, criterion, device):
+def validate(model, dataloader, criterion, device, normalizer):
     model.eval()
     running_loss = 0.0
     all_preds, all_targets = [], []
@@ -108,7 +129,7 @@ def validate(model, dataloader, criterion, device):
         for inputs, targets in tqdm(dataloader, desc="Validation"):
             inputs = inputs.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
-            inputs = normalize_on_gpu(inputs)
+            inputs = normalizer(inputs)
             outputs = model(inputs)
             loss = criterion(outputs, targets.unsqueeze(1))
             running_loss += loss.item() * inputs.size(0)
@@ -122,12 +143,13 @@ def validate(model, dataloader, criterion, device):
 def train_model(model, train_loader, val_loader, criterion, optimizer, 
                scheduler=None, num_epochs=50, device="cuda", 
                model_save_path="models", early_stopping_patience=10,
+               stats_path: str = None, # Path to stats.json
                accum_steps: int = 1, grad_clip: float = 0.0,
-               use_amp: bool = False, use_swa: bool = False, # SWA not implemented
-               augment: bool = False,
-               checkpoint_interval: int = 0):
+               use_amp: bool = False, augment: bool = False):
     os.makedirs(model_save_path, exist_ok=True)
     model = model.to(device)
+    normalizer = GlobalNormalizer(stats_path).to(device)
+
     best_mcc = -1.0
     best_model_path = os.path.join(model_save_path, "best_model.pth")
     no_improve_epochs = 0
@@ -138,11 +160,11 @@ def train_model(model, train_loader, val_loader, criterion, optimizer,
         start_time = time.time()
         
         train_loss, train_mcc = train_epoch(
-            model, train_loader, criterion, optimizer, device, 
+            model, train_loader, criterion, optimizer, device, normalizer,
             accum_steps=accum_steps, grad_clip=grad_clip, use_amp=use_amp, augment=augment
         )
         
-        val_loss, val_mcc = validate(model, val_loader, criterion, device)
+        val_loss, val_mcc = validate(model, val_loader, criterion, device, normalizer)
         
         if scheduler:
             if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):

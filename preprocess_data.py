@@ -11,6 +11,8 @@ import shutil
 import argparse
 import re
 
+import json
+
 def get_tile_id(filename):
     """Extract tile ID from filename."""
     match = re.search(r'(\d{2}_\d{2})', filename)
@@ -20,7 +22,7 @@ def preprocess_dataset(input_dir, output_dir):
     """
     Reads the original dataset, combines the 5 bands for each tile into a single
     NumPy array, and saves it to the output directory.
-    Also copies the label files.
+    Also computes global statistics for normalization and saves them.
     """
     print(f"Starting preprocessing...")
     print(f"Input directory: {input_dir}")
@@ -31,11 +33,52 @@ def preprocess_dataset(input_dir, output_dir):
     
     band_dirs = {f"Band{i}": os.path.join(input_dir, f"Band{i}") for i in range(1, 6)}
     
-    # Get all unique tile IDs from the first band
     all_files = os.listdir(band_dirs["Band1"])
     tile_ids = sorted(list(set(tid for f in all_files if (tid := get_tile_id(f)) is not None)))
 
     print(f"Found {len(tile_ids)} unique tiles to process.")
+
+    # --- Pass 1: Compute Global Statistics ---
+    print("--- Pass 1: Computing Global Statistics ---")
+    channel_sums = np.zeros(5, dtype=np.float64)
+    channel_sq_sums = np.zeros(5, dtype=np.float64)
+    pixel_counts = np.zeros(5, dtype=np.int64)
+
+    for tid in tqdm(tile_ids, desc="Calculating Stats"):
+        for i in range(1, 6):
+            band_dir = band_dirs[f"Band{i}"]
+            try:
+                matching_files = [f for f in os.listdir(band_dir) if tid in f]
+                if not matching_files:
+                    raise IndexError
+                fname = matching_files[0]
+                fp = os.path.join(band_dir, fname)
+                img = tifffile.imread(fp).astype(np.float64)
+                
+                # Use non-zero pixels for stats
+                valid_pixels = img[img > 0]
+                if valid_pixels.size > 0:
+                    channel_sums[i-1] += valid_pixels.sum()
+                    channel_sq_sums[i-1] += (valid_pixels**2).sum()
+                    pixel_counts[i-1] += valid_pixels.size
+
+            except (IndexError, FileNotFoundError):
+                continue # Skip if a file is missing, but continue stats calculation
+
+    mean = channel_sums / pixel_counts
+    # Var(X) = E[X^2] - (E[X])^2
+    variance = (channel_sq_sums / pixel_counts) - (mean**2)
+    std = np.sqrt(variance)
+
+    stats = {'mean': mean.tolist(), 'std': std.tolist()}
+    stats_path = os.path.join(output_dir, 'stats.json')
+    with open(stats_path, 'w') as f:
+        json.dump(stats, f)
+    print(f"Global stats saved to {stats_path}")
+    print(stats)
+
+    # --- Pass 2: Save Combined .npy Files ---
+    print("--- Pass 2: Saving Combined .npy Files ---")
 
     for tid in tqdm(tile_ids, desc="Processing Tiles"):
         bands = []

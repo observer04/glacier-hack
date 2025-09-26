@@ -144,6 +144,7 @@ def main(args):
         use_amp=args.amp,
         use_swa=args.swa,
         augment=args.augment,
+        stats_path=args.stats_path,
         checkpoint_interval=args.checkpoint_interval
     )
     
@@ -224,6 +225,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_save_path", type=str, default="./models", help="Path to save models")
     parser.add_argument("--augment", action="store_true", help="Enable simple flips/rotations for segmentation models")
     parser.add_argument("--use_combo_loader", action="store_true", help="Use the faster, pre-processed combo data loader")
+    parser.add_argument("--stats_path", type=str, default=None, help="Path to stats.json for global normalization")
     
     args = parser.parse_args()
     
