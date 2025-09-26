@@ -69,23 +69,39 @@ def run_sanity_check():
     # --- 2. Select Random Samples ---
     print(f"2. Selecting {NUM_SAMPLES} random samples from {ORIGINAL_DATA_DIR}...")
     try:
+        # Get all unique tile IDs from the label directory
         label_dir = os.path.join(ORIGINAL_DATA_DIR, "label")
-        all_tile_filenames = [f for f in os.listdir(label_dir) if f.endswith(".tif")]
-        if len(all_tile_filenames) < NUM_SAMPLES:
-            print(f"Error: Not enough samples in {label_dir} to run the check.")
+        all_tile_ids = list(set([get_tile_id_from_filename(f) for f in os.listdir(label_dir) if f.endswith(".tif")]))
+        all_tile_ids = [tid for tid in all_tile_ids if tid is not None]
+
+        if len(all_tile_ids) < NUM_SAMPLES:
+            print(f"Error: Not enough unique tile IDs in {label_dir} to run the check.")
             return False
         
-        selected_filenames = random.sample(all_tile_filenames, NUM_SAMPLES)
-        print(f"   Selected files: {selected_filenames}")
+        selected_tile_ids = random.sample(all_tile_ids, NUM_SAMPLES)
+        print(f"   Selected tile IDs: {selected_tile_ids}")
 
     except Exception as e:
         print(f"Error: Could not select random samples. Check that ORIGINAL_DATA_DIR is correct.")
         print(f"   Details: {e}")
         return False
 
-    # --- 3. Copy Files to Test Directory ---
+    # --- 3. Find corresponding filenames and copy ---
     print("3. Copying sample files to temporary test directory...")
     try:
+        # Create a map of tile_id -> filename from one of the band directories
+        band1_dir = os.path.join(ORIGINAL_DATA_DIR, "Band1")
+        id_to_filename_map = {get_tile_id_from_filename(f): f for f in os.listdir(band1_dir) if f.endswith(".tif")}
+        
+        selected_filenames = []
+        for tid in selected_tile_ids:
+            if tid not in id_to_filename_map:
+                print(f"Error: Could not find a corresponding file in Band1 for tile ID: {tid}")
+                return False
+            selected_filenames.append(id_to_filename_map[tid])
+        
+        print(f"   Resolved filenames to copy: {selected_filenames}")
+
         for filename in selected_filenames:
             for i in range(1, 6):
                 src_path = os.path.join(ORIGINAL_DATA_DIR, f"Band{i}", filename)
@@ -101,11 +117,11 @@ def run_sanity_check():
     # --- 4. Execute solution.py ---
     print(f"4. Executing {SOLUTION_SCRIPT_PATH}...")
     command = [
-        sys.executable, # Use the same python interpreter that is running this script
+        sys.executable,
         SOLUTION_SCRIPT_PATH,
         "--data", TEMP_TEST_DATA_DIR,
         "--out", TEMP_OUTPUT_DIR,
-        "--masks", TEMP_OUTPUT_DIR # This argument is unused but required
+        "--masks", TEMP_OUTPUT_DIR
     ]
     
     try:
@@ -123,7 +139,7 @@ def run_sanity_check():
         print(f"   --- stderr ---")
         print(e.stderr)
         return False
-    except subprocess.TimeoutExpired as e:
+    except subprocess.TimeoutExpired:
         print(f"Error: {SOLUTION_SCRIPT_PATH} timed out.")
         return False
     except FileNotFoundError:
@@ -138,7 +154,6 @@ def run_sanity_check():
             print(f"Failure: Expected {NUM_SAMPLES} output files, but found {len(output_files)}.")
             return False
         
-        # Check if filenames match
         if sorted(output_files) != sorted(selected_filenames):
             print("Failure: Output filenames do not match input filenames.")
             print(f"   Expected: {sorted(selected_filenames)}")
