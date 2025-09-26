@@ -4,8 +4,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-# Import our modules
-from data_utils import create_dataloaders, create_segmentation_dataloaders
+# import our modules
+from data_utils import compute_global_stats # Keep this one
 from models import PixelANN, UNet, DeepLabV3Plus, EfficientUNet
 from train_utils import train_model, CombinedLoss, FocalLoss, DiceLoss, WeightedBCELoss, TverskyLoss, BoundaryLoss, AdaptiveLoss, collect_validation_probs
 import random
@@ -25,8 +25,10 @@ def main(args):
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Create dataloaders: pixel-wise for PixelANN, tile-wise for UNet/DeepLab
+    # Create dataloaders
     if args.model_type == "pixelann":
+        from data_utils import create_dataloaders
+        # This part remains for the pixelann model, which doesn't have a combo loader
         train_loader, val_loader = create_dataloaders(
             args.data_dir,
             batch_size=args.batch_size,
@@ -37,14 +39,30 @@ def main(args):
     else:
         # For segmentation models, batch size is per tile; default smaller
         seg_batch = max(1, min(args.batch_size, 4))  # keep small to avoid OOM
-        train_loader, val_loader = create_segmentation_dataloaders(
-            args.data_dir,
-            batch_size=seg_batch,
-            val_split=args.val_split,
-            num_workers=args.num_workers,
-            use_global_stats=args.global_stats,
-            augment=args.augment,
-        )
+
+        if args.use_combo_loader:
+            from data_utils_combo import create_segmentation_dataloaders_combo
+            print("--- Using pre-processed combo data loader ---")
+            train_loader, val_loader = create_segmentation_dataloaders_combo(
+                args.data_dir, # This will now point to the processed data directory
+                batch_size=seg_batch,
+                val_split=args.val_split,
+                num_workers=args.num_workers,
+                augment=args.augment,
+            )
+        else:
+            from data_utils import create_segmentation_dataloaders
+            print("--- Using standard TIFF data loader ---")
+            # Note: global_stats is only computed for the standard loader
+            global_stats = compute_global_stats(args.data_dir, sample_ratio=0.1) if args.global_stats else None
+            train_loader, val_loader = create_segmentation_dataloaders(
+                args.data_dir,
+                batch_size=seg_batch,
+                val_split=args.val_split,
+                num_workers=args.num_workers,
+                augment=args.augment,
+                global_stats=global_stats
+            )
     
     # Create model
     if args.model_type == "pixelann":
@@ -204,6 +222,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=4, help="Number of workers for data loading")
     parser.add_argument("--model_save_path", type=str, default="./models", help="Path to save models")
     parser.add_argument("--augment", action="store_true", help="Enable simple flips/rotations for segmentation models")
+    parser.add_argument("--use_combo_loader", action="store_true", help="Use the faster, pre-processed combo data loader")
     
     args = parser.parse_args()
     

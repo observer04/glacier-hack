@@ -1,0 +1,143 @@
+# kaggle.py - FULLY AUTOMATED - Pre-process, Search, and Train
+
+print("--- Starting Fully Automated Kaggle Workflow ---")
+
+# 1. Install Optuna
+!pip install optuna -q
+
+# 2. Standard Imports
+import os
+import torch
+import torch.optim as optim
+import torch.nn as nn
+import optuna
+import shutil
+
+# --- This cell assumes you have already run your setup cell to clone the repo and download data ---
+
+# --- Configuration ---
+ORIGINAL_DATA_DIR = "/content/Train"
+PROCESSED_DATA_DIR = "/content/Train_processed" # Directory for the high-speed data
+KAGGLE_WORKING_DIR = "/kaggle/working/"
+N_TRIALS = 25
+TRIAL_EPOCHS = 25
+
+# --- STEP 1: Pre-process the dataset for speed ---
+print("\n" + "*"*80)
+print("STEP 1: PRE-PROCESSING DATASET FOR FASTER TRAINING")
+print("*"*80 + "\n")
+
+preprocess_command = f"python preprocess_data.py --input_dir {ORIGINAL_DATA_DIR} --output_dir {PROCESSED_DATA_DIR}"
+!{preprocess_command}
+
+print("\n--- Pre-processing complete. ---")
+
+# --- STEP 2: Run Optuna Hyperparameter Search ---
+print("\n" + "*"*80)
+print("STEP 2: STARTING OPTUNA HYPERPARAMETER SEARCH")
+print("This will take several hours.")
+print("*"*80 + "\n")
+
+# Import from your project scripts AFTER they are available
+from data_utils_combo import create_segmentation_dataloaders_combo
+from models import UNet
+from train_utils import train_model, TverskyLoss
+
+def objective(trial: optuna.trial.Trial) -> float:
+    print(f"\n--- Starting Trial {trial.number} ---")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    lr = trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)
+    weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
+    tversky_alpha = trial.suggest_float("tversky_alpha", 0.3, 0.7)
+    optimizer_name = trial.suggest_categorical("optimizer", ["Adam", "SGD"])
+    batch_size = trial.suggest_categorical("batch_size", [8, 16, 24]) # Can try larger batches now
+
+    tversky_beta = 1.0 - tversky_alpha
+
+    train_loader, val_loader = create_segmentation_dataloaders_combo(
+        PROCESSED_DATA_DIR, batch_size=batch_size, num_workers=4, augment=True
+    )
+    
+    model = UNet(in_channels=5, out_channels=1)
+    if torch.cuda.device_count() > 1:
+      print(f"--- Using {torch.cuda.device_count()} GPUs via DataParallel ---")
+      model = nn.DataParallel(model)
+    model.to(device)
+
+    criterion = TverskyLoss(alpha=tversky_alpha, beta=tversky_beta)
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay) if optimizer_name == "Adam" else optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay)
+
+    try:
+        trial_save_path = os.path.join(KAGGLE_WORKING_DIR, f"optuna_trial_{trial.number}")
+        _, history = train_model(
+            model=model, train_loader=train_loader, val_loader=val_loader,
+            criterion=criterion, optimizer=optimizer, num_epochs=TRIAL_EPOCHS,
+            device=device, model_save_path=trial_save_path,
+            early_stopping_patience=7, use_amp=True
+        )
+        best_val_mcc = max(history.get("val_mcc", [0]))
+        shutil.rmtree(trial_save_path, ignore_errors=True)
+
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower():
+            print(f"--- Trial {trial.number} ran out of memory and will be pruned. ---")
+            raise optuna.exceptions.TrialPruned()
+        else:
+            raise e
+
+    return best_val_mcc
+
+study = optuna.create_study(direction="maximize")
+study.optimize(objective, n_trials=N_TRIALS)
+
+# --- STEP 3: Train Final Model ---
+print("\n\n--- Optuna Search Complete ---")
+best_trial = study.best_trial
+print(f"Best trial achieved a validation MCC of: {best_trial.value:.4f}")
+print("\nOptimal hyperparameters found:")
+for key, value in best_trial.params.items():
+    print(f"  --{key}: {value}")
+
+print("\n" + "*"*80)
+print("STEP 3: BEGINNING FINAL MODEL TRAINING WITH THE BEST PARAMETERS.")
+print("This will take several hours.")
+print("*"*80 + "\n")
+
+final_model_path = os.path.join(KAGGLE_WORKING_DIR, "final_submission_assets")
+
+final_command = f"python train_model.py " \
+                f"--data_dir '{PROCESSED_DATA_DIR}' " \
+                f"--use_combo_loader " \
+                f"--model_type unet " \
+                f"--loss tversky " \
+                f"--tversky_alpha {best_trial.params['tversky_alpha']:.4f} " \
+                f"--tversky_beta {1.0 - best_trial.params['tversky_alpha']:.4f} " \
+                f"--learning_rate {best_trial.params['learning_rate']:.6f} " \
+                f"--weight_decay {best_trial.params['weight_decay']:.6f} " \
+                f"--batch_size {best_trial.params['batch_size']} " \
+                f"--epochs 150 " \
+                f"--optimizer {best_trial.params['optimizer'].lower()} " \
+                f"--scheduler plateau " \
+                f"--amp " \
+                f"--augment " \
+                f"--threshold_sweep " \
+                f"--early_stopping_patience 20 " \
+                f"--num_workers 4 " \
+                f"--model_save_path '{final_model_path}'"
+
+print("Executing final training command:\n")
+print(final_command)
+print("\n" + "-"*80 + "\n")
+
+os.system(final_command)
+
+print("\n" + "*"*80)
+print("WORKFLOW COMPLETE.")
+print(f"Your final model ('model.pth') is saved in: {final_model_path}")
+print("You can now download the contents of this folder for submission.")
+print("*"*80)
+
+if os.path.exists("solution.py"):
+    shutil.copy("solution.py", os.path.join(final_model_path, "solution.py"))
+    print("Copied 'solution.py' template into the final submission folder.")
