@@ -87,14 +87,14 @@ print("Sample files:", train_files[:3])
 
 ## Cell 5: Start Training (UNet + Tversky - Recommended)
 ```python
-# Start the optimized training
+# Start the optimized training - saves to Google Drive
 !python train_model.py \
     --model_type unet \
     --loss_type tversky \
     --batch_size 2 \
     --epochs 80 \
     --lr 0.001 \
-    --save_dir /kaggle/working/models \
+    --save_dir /content/drive/MyDrive/glacier_hack \
     --use_amp \
     --use_swa \
     --threshold_sweep \
@@ -116,7 +116,7 @@ print("Sample files:", train_files[:3])
     --batch_size 4 \
     --epochs 60 \
     --lr 0.002 \
-    --save_dir /kaggle/working/models \
+    --save_dir /content/drive/MyDrive/glacier_hack \
     --use_amp \
     --use_swa \
     --threshold_sweep \
@@ -135,7 +135,7 @@ print("Sample files:", train_files[:3])
     --batch_size 1 \
     --epochs 100 \
     --lr 0.0005 \
-    --save_dir /kaggle/working/models \
+    --save_dir /content/drive/MyDrive/glacier_hack \
     --use_amp \
     --use_swa \
     --threshold_sweep \
@@ -151,14 +151,15 @@ print("Sample files:", train_files[:3])
 # Monitor training (run this in a separate cell while training)
 import time
 import matplotlib.pyplot as plt
+import glob
 
 def monitor_training():
-    """Monitor training progress by reading logs"""
-    log_files = glob.glob('/kaggle/working/models/*/training.log')
+    """Monitor training progress by reading logs from Google Drive"""
+    log_files = glob.glob('/content/drive/MyDrive/glacier_hack/*/training.log')
     if log_files:
         latest_log = max(log_files, key=os.path.getctime)
         print(f"Monitoring: {latest_log}")
-        !tail -20 {latest_log}
+        !tail -20 "{latest_log}"
     else:
         print("No training logs found yet...")
 
@@ -166,34 +167,38 @@ def monitor_training():
 monitor_training()
 ```
 
-## Cell 7: Save Results to Kaggle Output
+## Cell 7: Prepare Final Submission Files
 ```python
-# After training completes, save results
+# After training completes, prepare submission files
 import shutil
+import glob
 
-# Create output directory
-os.makedirs('/kaggle/working/final_output', exist_ok=True)
-
-# Find the best model
-model_dirs = glob.glob('/kaggle/working/models/*')
+# Find the best model in Google Drive
+model_dirs = glob.glob('/content/drive/MyDrive/glacier_hack/*')
 if model_dirs:
     latest_model_dir = max(model_dirs, key=os.path.getctime)
     print(f"Latest model directory: {latest_model_dir}")
     
-    # Copy best model and solution.py
+    # Create submission directory in Google Drive
+    submission_dir = '/content/drive/MyDrive/glacier_hack/submission'
+    os.makedirs(submission_dir, exist_ok=True)
+    
+    # Copy best model and solution.py for submission
     best_model = glob.glob(f'{latest_model_dir}/best_model.pth')
     if best_model:
-        shutil.copy(best_model[0], '/kaggle/working/final_output/model.pth')
-        shutil.copy('solution.py', '/kaggle/working/final_output/')
-        print("✅ Model and solution copied to final_output/")
+        shutil.copy(best_model[0], f'{submission_dir}/model.pth')
+        shutil.copy('/kaggle/working/glacier-hack/solution.py', f'{submission_dir}/')
+        print("✅ Model and solution copied to Google Drive submission folder!")
     
-    # Copy training logs and plots
-    for file_pattern in ['*.log', '*.png', '*.txt']:
-        files = glob.glob(f'{latest_model_dir}/{file_pattern}')
-        for file in files:
-            shutil.copy(file, '/kaggle/working/final_output/')
+    # Also copy to Kaggle output for download
+    os.makedirs('/kaggle/working/final_output', exist_ok=True)
+    shutil.copy(f'{submission_dir}/model.pth', '/kaggle/working/final_output/')
+    shutil.copy(f'{submission_dir}/solution.py', '/kaggle/working/final_output/')
     
-    print("Files in final_output:")
+    print("\n✅ Files ready in both locations:")
+    print("Google Drive:", submission_dir)
+    !ls -la "{submission_dir}"
+    print("\nKaggle Output:", '/kaggle/working/final_output')
     !ls -la /kaggle/working/final_output/
 ```
 
