@@ -71,52 +71,11 @@ class GlacierDatasetCombo(Dataset):
         x_path = os.path.join(self.processed_dir, f"{tid}.npy")
         x = np.load(x_path)
 
-        # Normalize the image
-        x = normalize_image(x)
+        # Convert to tensors. Augmentation and Normalization will be done on the GPU.
+        x = torch.from_numpy(x.copy()).permute(2, 0, 1) # (H, W, C) -> (C, H, W)
+        y = torch.from_numpy(y.copy()) # (H, W)
 
-        # Load the label
-        label_path = _find_label_path(self.label_dir, tid)
-        y = np.array(Image.open(label_path))
-        if y.ndim == 3:
-            y = y[..., 0]
-        y = (y > 0).astype(np.float32)
-
-        # Convert to tensors before augmentation for consistency
-        # Permute x from (H, W, C) to (C, H, W)
-        x = torch.from_numpy(x.copy()).permute(2, 0, 1)
-        y = torch.from_numpy(y.copy()).unsqueeze(0) # Add channel dim: (1, H, W)
-
-        # Apply augmentations using torchvision.transforms.functional for synchronization
-        if self.is_training and self.augment:
-            if random.random() > 0.5:
-                x = TF.hflip(x)
-                y = TF.hflip(y)
-            if random.random() > 0.5:
-                x = TF.vflip(x)
-                y = TF.vflip(y)
-            
-            # Random rotation
-            angle = random.choice([0, 90, 180, 270])
-            if angle != 0:
-                x = TF.rotate(x, angle)
-                y = TF.rotate(y, angle)
-
-            # Photometric augmentations (on image only) - manual implementation for 5 channels
-            if random.random() > 0.5:
-                # Adjust brightness and contrast
-                contrast = random.uniform(0.8, 1.2)
-                brightness = random.uniform(-0.1, 0.1)
-                x = x * contrast + brightness
-
-            if random.random() > 0.5:
-                # Add Gaussian noise
-                noise = torch.randn_like(x) * 0.05 # Add noise with std dev 0.05
-                x = x + noise
-            
-            # Clip to a reasonable range after photometric changes
-            x = torch.clamp(x, -5.0, 5.0)
-
-        return x, y.squeeze(0) # Return y as (H, W)
+        return x, y
 
 
 def create_segmentation_dataloaders_combo(processed_dir, batch_size=2, val_split=0.2, num_workers=4, augment: bool=False):
