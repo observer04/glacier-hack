@@ -101,13 +101,20 @@ class GlacierDatasetCombo(Dataset):
                 x = TF.rotate(x, angle)
                 y = TF.rotate(y, angle)
 
-            # Photometric augmentations (on image only)
+            # Photometric augmentations (on image only) - manual implementation for 5 channels
             if random.random() > 0.5:
-                x = TF.gaussian_blur(x, kernel_size=3)
+                # Adjust brightness and contrast
+                contrast = random.uniform(0.8, 1.2)
+                brightness = random.uniform(-0.1, 0.1)
+                x = x * contrast + brightness
+
             if random.random() > 0.5:
-                x = TF.adjust_brightness(x, brightness_factor=random.uniform(0.8, 1.2))
-            if random.random() > 0.5:
-                x = TF.adjust_contrast(x, contrast_factor=random.uniform(0.8, 1.2))
+                # Add Gaussian noise
+                noise = torch.randn_like(x) * 0.05 # Add noise with std dev 0.05
+                x = x + noise
+            
+            # Clip to a reasonable range after photometric changes
+            x = torch.clamp(x, -5.0, 5.0)
 
         return x, y.squeeze(0) # Return y as (H, W)
 
