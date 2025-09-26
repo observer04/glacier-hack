@@ -143,6 +143,7 @@ def main(args):
         grad_clip=args.grad_clip,
         use_amp=args.amp,
         use_swa=args.swa,
+        augment=args.augment,
         checkpoint_interval=args.checkpoint_interval
     )
     

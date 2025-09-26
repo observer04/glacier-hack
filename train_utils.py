@@ -1,7 +1,5 @@
-
-
-# train_utils.py - High-Performance Version
-# Normalization and Augmentation are performed on the GPU.
+# train_utils.py - High-Performance Version v2
+# Normalization and Augmentation are performed on the GPU and are flag-controlled.
 
 import os
 import time
@@ -15,13 +13,11 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import matthews_corrcoef, f1_score, precision_score, recall_score
 import random
 
-# --- NEW: GPU-Side Data Processing Functions ---
-
+# --- GPU-Side Data Processing Functions ---
 def normalize_on_gpu(x: torch.Tensor) -> torch.Tensor:
     """Normalizes a batch of images on the GPU, channel-wise."""
-    # x shape is (N, C, H, W)
     x = x.float()
-    for i in range(x.shape[1]): # Iterate over channels
+    for i in range(x.shape[1]):
         channel_data = x[:, i, :, :]
         mean = channel_data.mean()
         std = channel_data.std()
@@ -33,68 +29,53 @@ def normalize_on_gpu(x: torch.Tensor) -> torch.Tensor:
 
 def augment_on_gpu(images: torch.Tensor, masks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Applies random augmentations to a batch of images and masks on the GPU."""
-    # Add a channel dimension to masks for compatibility with flips if it's (N, H, W)
     if masks.dim() == 3:
         masks = masks.unsqueeze(1)
 
-    # Random horizontal flips
     if random.random() > 0.5:
-        images = torch.flip(images, dims=[3])
-        masks = torch.flip(masks, dims=[3])
-
-    # Random vertical flips
+        images, masks = torch.flip(images, dims=[3]), torch.flip(masks, dims=[3])
     if random.random() > 0.5:
-        images = torch.flip(images, dims=[2])
-        masks = torch.flip(masks, dims=[2])
+        images, masks = torch.flip(images, dims=[2]), torch.flip(masks, dims=[2])
 
-    # Photometric augmentations (on images only)
     if random.random() > 0.5:
         contrast = torch.empty(1, device=images.device).uniform_(0.8, 1.2)
         brightness = torch.empty(1, device=images.device).uniform_(-0.1, 0.1)
         images = images * contrast + brightness
-
     if random.random() > 0.5:
         noise = torch.randn_like(images) * 0.05
         images = images + noise
 
-    # Clip to a reasonable range
     images = torch.clamp(images, -5.0, 5.0)
+    return images, masks.squeeze(1)
 
-    return images, masks.squeeze(1) # Return mask as (N, H, W)
-
-# --- Loss Functions (Unchanged) ---
+# --- Loss Functions ---
 class TverskyLoss(nn.Module):
     def __init__(self, alpha=0.7, beta=0.3, smooth=1e-6):
         super(TverskyLoss, self).__init__()
-        self.alpha = alpha
-        self.beta = beta
-        self.smooth = smooth
+        self.alpha, self.beta, self.smooth = alpha, beta, smooth
 
     def forward(self, y_pred, y_true):
-        y_true_pos = y_true.view(-1)
-        y_pred_pos = y_pred.view(-1)
+        y_true_pos, y_pred_pos = y_true.view(-1), y_pred.view(-1)
         true_pos = (y_true_pos * y_pred_pos).sum()
         false_neg = (y_true_pos * (1 - y_pred_pos)).sum()
         false_pos = ((1 - y_true_pos) * y_pred_pos).sum()
-        tversky = (true_pos + self.smooth) / (true_pos + self.alpha * false_pos + self.beta * false_neg + self.smooth)
-        return 1 - tversky
+        return 1 - (true_pos + self.smooth) / (true_pos + self.alpha * false_pos + self.beta * false_neg + self.smooth)
 
-# --- Core Training & Validation Loops (Modified for GPU processing) ---
-
-def train_epoch(model, dataloader, criterion, optimizer, device, accum_steps: int = 1, grad_clip: float = 0.0, use_amp: bool = False):
+# --- Core Training & Validation Loops ---
+def train_epoch(model, dataloader, criterion, optimizer, device, accum_steps: int, grad_clip: float, use_amp: bool, augment: bool):
     model.train()
     running_loss = 0.0
     all_preds, all_targets = [], []
     scaler = torch.amp.GradScaler(enabled=use_amp)
-
     optimizer.zero_grad()
+
     for step, (inputs, targets) in enumerate(tqdm(dataloader, desc="Training")):
         inputs = inputs.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
-        # GPU-SIDE PROCESSING
         inputs = normalize_on_gpu(inputs)
-        inputs, targets = augment_on_gpu(inputs, targets)
+        if augment:
+            inputs, targets = augment_on_gpu(inputs, targets)
 
         with torch.amp.autocast(device_type=device, enabled=use_amp):
             outputs = model(inputs)
@@ -123,24 +104,18 @@ def validate(model, dataloader, criterion, device):
     model.eval()
     running_loss = 0.0
     all_preds, all_targets = [], []
-
     with torch.no_grad():
         for inputs, targets in tqdm(dataloader, desc="Validation"):
             inputs = inputs.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
-
-            # GPU-SIDE NORMALIZATION (No augmentation for validation)
             inputs = normalize_on_gpu(inputs)
-
             outputs = model(inputs)
             loss = criterion(outputs, targets.unsqueeze(1))
-
             running_loss += loss.item() * inputs.size(0)
             preds_np = (torch.sigmoid(outputs) > 0.5).byte().cpu().numpy().reshape(-1)
             targs_np = targets.byte().cpu().numpy().reshape(-1)
             all_preds.extend(preds_np)
             all_targets.extend(targs_np)
-
     mcc = matthews_corrcoef(all_targets, all_preds)
     return running_loss / len(dataloader.dataset), mcc
 
@@ -148,11 +123,11 @@ def train_model(model, train_loader, val_loader, criterion, optimizer,
                scheduler=None, num_epochs=50, device="cuda", 
                model_save_path="models", early_stopping_patience=10,
                accum_steps: int = 1, grad_clip: float = 0.0,
-               use_amp: bool = False, use_swa: bool = False, # SWA not implemented in this version
+               use_amp: bool = False, use_swa: bool = False, # SWA not implemented
+               augment: bool = False,
                checkpoint_interval: int = 0):
     os.makedirs(model_save_path, exist_ok=True)
     model = model.to(device)
-    
     best_mcc = -1.0
     best_model_path = os.path.join(model_save_path, "best_model.pth")
     no_improve_epochs = 0
@@ -164,12 +139,12 @@ def train_model(model, train_loader, val_loader, criterion, optimizer,
         
         train_loss, train_mcc = train_epoch(
             model, train_loader, criterion, optimizer, device, 
-            accum_steps=accum_steps, grad_clip=grad_clip, use_amp=use_amp
+            accum_steps=accum_steps, grad_clip=grad_clip, use_amp=use_amp, augment=augment
         )
         
         val_loss, val_mcc = validate(model, val_loader, criterion, device)
         
-        if scheduler is not None:
+        if scheduler:
             if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
                 scheduler.step(val_mcc)
             else:
