@@ -1,4 +1,5 @@
-# kaggle.py - MONOLITHIC SCRIPT - V5
+
+# kaggle.py - MONOLITHIC SCRIPT V6.1 - FINAL FIX
 # All code is self-contained in this single file to eliminate import/NameError issues.
 
 print("--- Starting Monolithic Kaggle Workflow ---")
@@ -21,9 +22,12 @@ from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 import random
 import json
+from sklearn.metrics import matthews_corrcoef
+import time
+import tifffile # <<< THE MISSING IMPORT
 
 # ======================================================================================
-# SECTION 1: MODEL DEFINITION (from models.py)
+# SECTION 1: MODEL DEFINITION
 # ======================================================================================
 print("Defining model architectures...")
 
@@ -77,7 +81,7 @@ class UNet(nn.Module):
         return self.final(dec4)
 
 # ======================================================================================
-# SECTION 2: DATA UTILITIES (from data_utils_combo.py)
+# SECTION 2: DATA UTILITIES
 # ======================================================================================
 print("Defining data utilities...")
 
@@ -89,9 +93,9 @@ def _find_label_path(label_dir: str, tile_id: str):
     return None
 
 class GlacierDatasetCombo(Dataset):
-    def __init__(self, processed_dir, is_training=True, val_split=0.2, random_state=42, augment: bool=False):
+    def __init__(self, processed_dir, is_training=True, val_split=0.2, random_state=42):
         super().__init__()
-        self.processed_dir, self.is_training, self.augment = processed_dir, is_training, augment
+        self.processed_dir = processed_dir
         self.label_dir = os.path.join(processed_dir, "label")
         if not os.path.exists(self.label_dir):
             raise ValueError(f"Label directory not found in {self.processed_dir}")
@@ -110,26 +114,23 @@ class GlacierDatasetCombo(Dataset):
         x = np.load(x_path)
         label_path = _find_label_path(self.label_dir, tid)
         y = np.array(Image.open(label_path))
-        if y.ndim == 3:
-            y = y[..., 0]
+        if y.ndim == 3: y = y[..., 0]
         y = (y > 0).astype(np.float32)
         x = torch.from_numpy(x.copy()).permute(2, 0, 1)
         y = torch.from_numpy(y.copy())
         return x, y
 
 def create_segmentation_dataloaders_combo(processed_dir, batch_size=2, val_split=0.2, num_workers=4, augment: bool=False):
-    train_dataset = GlacierDatasetCombo(processed_dir, is_training=True, val_split=val_split, augment=augment)
-    val_dataset = GlacierDatasetCombo(processed_dir, is_training=False, val_split=val_split, augment=False)
+    train_dataset = GlacierDatasetCombo(processed_dir, is_training=True, val_split=val_split)
+    val_dataset = GlacierDatasetCombo(processed_dir, is_training=False, val_split=val_split)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
     return train_loader, val_loader
 
 # ======================================================================================
-# SECTION 3: TRAINING UTILITIES (from train_utils.py)
+# SECTION 3: TRAINING UTILITIES
 # ======================================================================================
 print("Defining training utilities...")
-
-from sklearn.metrics import matthews_corrcoef
 
 class TverskyLoss(nn.Module):
     def __init__(self, alpha=0.7, beta=0.3, smooth=1e-6):
@@ -144,12 +145,9 @@ class TverskyLoss(nn.Module):
         return 1 - (true_pos + self.smooth) / (true_pos + self.alpha * false_pos + self.beta * false_neg + self.smooth)
 
 def augment_on_gpu(images: torch.Tensor, masks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    if masks.dim() == 3:
-        masks = masks.unsqueeze(1)
-    if random.random() > 0.5:
-        images, masks = torch.flip(images, dims=[3]), torch.flip(masks, dims=[3])
-    if random.random() > 0.5:
-        images, masks = torch.flip(images, dims=[2]), torch.flip(masks, dims=[2])
+    if masks.dim() == 3: masks = masks.unsqueeze(1)
+    if random.random() > 0.5: images, masks = torch.flip(images, dims=[3]), torch.flip(masks, dims=[3])
+    if random.random() > 0.5: images, masks = torch.flip(images, dims=[2]), torch.flip(masks, dims=[2])
     if random.random() > 0.5:
         contrast = torch.empty(1, device=images.device).uniform_(0.8, 1.2)
         brightness = torch.empty(1, device=images.device).uniform_(-0.1, 0.1)
@@ -169,8 +167,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, normalizer, acc
     for step, (inputs, targets) in enumerate(tqdm(dataloader, desc="Training")):
         inputs, targets = inputs.to(device, non_blocking=True), targets.to(device, non_blocking=True)
         inputs = normalizer(inputs)
-        if augment:
-            inputs, targets = augment_on_gpu(inputs, targets)
+        if augment: inputs, targets = augment_on_gpu(inputs, targets)
         with torch.amp.autocast(device_type=device, enabled=use_amp):
             outputs = model(inputs)
             loss = criterion(outputs, targets.unsqueeze(1))
@@ -207,17 +204,17 @@ def validate(model, dataloader, criterion, device, normalizer):
     return running_loss / len(dataloader.dataset), matthews_corrcoef(all_targets, all_preds)
 
 def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, device, model_save_path, stats_path, early_stopping_patience, accum_steps, grad_clip, use_amp, augment):
+    # NOTE: GlobalNormalizer is defined inside this function to guarantee scope
     class GlobalNormalizer(nn.Module):
         def __init__(self, stats_path):
             super().__init__()
             try:
-                with open(stats_path, 'r') as f:
-                    stats = json.load(f)
+                with open(stats_path, 'r') as f: stats = json.load(f)
                 self.mean = torch.tensor(stats['mean']).view(1, 5, 1, 1)
                 self.std = torch.tensor(stats['std']).view(1, 5, 1, 1)
                 print(f"Loaded global stats from {stats_path}")
             except (FileNotFoundError, TypeError):
-                print(f"Warning: stats.json not found or invalid. Using fallback per-batch normalization.")
+                print(f"Warning: stats.json not found. Using fallback per-batch normalization.")
                 self.mean = None
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             x = x.float()
@@ -243,16 +240,12 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         train_loss, train_mcc = train_epoch(model, train_loader, criterion, optimizer, device, normalizer, accum_steps, grad_clip, use_amp, augment)
         val_loss, val_mcc = validate(model, val_loader, criterion, device, normalizer)
         if scheduler:
-            if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step(val_mcc)
-            else:
-                scheduler.step()
+            if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau): scheduler.step(val_mcc)
+            else: scheduler.step()
         epoch_time = time.time() - start_time
         print(f"Train Loss: {train_loss:.4f}, MCC: {train_mcc:.4f} | Val Loss: {val_loss:.4f}, MCC: {val_mcc:.4f} | Time: {epoch_time:.2f}s")
-        history["train_loss"].append(train_loss)
-        history["val_loss"].append(val_loss)
-        history["train_mcc"].append(train_mcc)
-        history["val_mcc"].append(val_mcc)
+        history["train_loss"].append(train_loss); history["val_loss"].append(val_loss)
+        history["train_mcc"].append(train_mcc); history["val_mcc"].append(val_mcc)
         if val_mcc > best_mcc:
             best_mcc = val_mcc
             torch.save(model.state_dict(), os.path.join(model_save_path, "best_model.pth"))
@@ -260,7 +253,6 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             no_improve_epochs = 0
         else:
             no_improve_epochs += 1
-            print(f"No improvement for {no_improve_epochs} epochs")
         if no_improve_epochs >= early_stopping_patience:
             print(f"Early stopping after {epoch+1} epochs")
             break
@@ -280,40 +272,34 @@ KAGGLE_WORKING_DIR = "/kaggle/working/"
 N_TRIALS = 15
 TRIAL_EPOCHS = 30
 
-# --- Preprocessing ---
+# --- Preprocessing Function ---
 def get_tile_id_preprocess(filename):
     match = re.search(r'(\d{2}_\d{2})', filename)
     return match.group(1) if match else None
 
 def run_preprocessing(input_dir, output_dir):
-    print("\n" + "*"*80)
-    print("STEP 1: PRE-PROCESSING DATASET FOR FASTER TRAINING")
-    print("*"*80 + "\n")
+    print("\n" + "*"*80 + "\nSTEP 1: PRE-PROCESSING DATASET FOR FASTER TRAINING\n" + "*"*80 + "\n")
     os.makedirs(output_dir, exist_ok=True)
     band_dirs = {f"Band{i}": os.path.join(input_dir, f"Band{i}") for i in range(1, 6)}
-    all_files = os.listdir(band_dirs["Band1"])
-    tile_ids = sorted(list(set(tid for f in all_files if (tid := get_tile_id_preprocess(f)) is not None)))
+    tile_ids = sorted(list(set(tid for f in os.listdir(band_dirs["Band1"]) if (tid := get_tile_id_preprocess(f)) is not None)))
     print(f"Found {len(tile_ids)} unique tiles to process.")
 
     print("--- Pass 1: Computing Global Statistics ---")
     channel_sums, channel_sq_sums, pixel_counts = np.zeros(5, dtype=np.float64), np.zeros(5, dtype=np.float64), np.zeros(5, dtype=np.int64)
     for tid in tqdm(tile_ids, desc="Calculating Stats"):
         for i in range(1, 6):
-            band_dir = band_dirs[f"Band{i}"]
             try:
-                matching_files = [f for f in os.listdir(band_dir) if tid in f]
+                matching_files = [f for f in os.listdir(band_dirs[f"Band{i}"]) if tid in f]
                 if not matching_files: raise IndexError
-                img = tifffile.imread(os.path.join(band_dir, matching_files[0])).astype(np.float64)
+                img = tifffile.imread(os.path.join(band_dirs[f"Band{i}"], matching_files[0])).astype(np.float64)
                 valid_pixels = img[img > 0]
                 if valid_pixels.size > 0:
-                    channel_sums[i-1] += valid_pixels.sum()
-                    channel_sq_sums[i-1] += (valid_pixels**2).sum()
-                    pixel_counts[i-1] += valid_pixels.size
+                    channel_sums[i-1] += valid_pixels.sum(); channel_sq_sums[i-1] += (valid_pixels**2).sum(); pixel_counts[i-1] += valid_pixels.size
             except (IndexError, FileNotFoundError): continue
-    mean, std = channel_sums / pixel_counts, np.sqrt((channel_sq_sums / pixel_counts) - (mean**2))
+    mean = channel_sums / pixel_counts
+    std = np.sqrt((channel_sq_sums / pixel_counts) - (mean**2))
     stats = {'mean': mean.tolist(), 'std': std.tolist()}
-    with open(STATS_PATH, 'w') as f:
-        json.dump(stats, f)
+    with open(STATS_PATH, 'w') as f: json.dump(stats, f)
     print(f"Global stats saved to {STATS_PATH}")
 
     print("--- Pass 2: Saving Combined .npy Files ---")
@@ -321,21 +307,16 @@ def run_preprocessing(input_dir, output_dir):
         bands = []
         all_bands_exist = True
         for i in range(1, 6):
-            band_dir = band_dirs[f"Band{i}"]
             try:
-                matching_files = [f for f in os.listdir(band_dir) if tid in f]
+                matching_files = [f for f in os.listdir(band_dirs[f"Band{i}"]) if tid in f]
                 if not matching_files: raise IndexError
-                bands.append(tifffile.imread(os.path.join(band_dir, matching_files[0])))
-            except (IndexError, FileNotFoundError):
-                all_bands_exist = False
-                break
+                bands.append(tifffile.imread(os.path.join(band_dirs[f"Band{i}"], matching_files[0])))
+            except (IndexError, FileNotFoundError): all_bands_exist = False; break
         if not all_bands_exist: continue
-        combined_array = np.stack(bands, axis=-1).astype(np.int16)
-        np.save(os.path.join(output_dir, f"{tid}.npy"), combined_array)
+        np.save(os.path.join(output_dir, f"{tid}.npy"), np.stack(bands, axis=-1).astype(np.int16))
     
     input_label_dir, output_label_dir = os.path.join(input_dir, "label"), os.path.join(output_dir, "label")
-    if os.path.exists(input_label_dir):
-        shutil.copytree(input_label_dir, output_label_dir, dirs_exist_ok=True)
+    if os.path.exists(input_label_dir): shutil.copytree(input_label_dir, output_label_dir, dirs_exist_ok=True)
     print("\n--- Pre-processing complete. ---")
 
 # --- Optuna Objective ---
@@ -349,10 +330,9 @@ def objective(trial: optuna.trial.Trial) -> float:
     batch_size = trial.suggest_categorical("batch_size", [8, 16])
     augment = trial.suggest_categorical("augment", [True, False])
 
-    train_loader, val_loader = create_segmentation_dataloaders_combo(PROCESSED_DATA_DIR, batch_size=batch_size, num_workers=2, augment=augment)
+    train_loader, val_loader = create_segmentation_dataloaders_combo(PROCESSED_DATA_DIR, batch_size=batch_size, num_workers=2)
     model = UNet(in_channels=5, out_channels=1)
-    if torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)
+    if torch.cuda.device_count() > 1: model = nn.DataParallel(model)
     model.to(device)
 
     criterion = TverskyLoss(alpha=tversky_alpha, beta=(1.0-tversky_alpha))
@@ -365,10 +345,8 @@ def objective(trial: optuna.trial.Trial) -> float:
         best_val_mcc = max(history.get("val_mcc", [0.0]))
         shutil.rmtree(trial_save_path, ignore_errors=True)
     except RuntimeError as e:
-        if "out of memory" in str(e).lower():
-            raise optuna.exceptions.TrialPruned()
-        else:
-            raise e
+        if "out of memory" in str(e).lower(): raise optuna.exceptions.TrialPruned()
+        else: raise e
     return best_val_mcc
 
 # --- Main Runner ---
@@ -381,13 +359,10 @@ if __name__ == '__main__':
     best_trial = study.best_trial
     print(f"Best trial achieved a validation MCC of: {best_trial.value:.4f}")
     print("\nOptimal hyperparameters found:")
-    for key, value in best_trial.params.items():
-        print(f"  --{key}: {value}")
+    for key, value in best_trial.params.items(): print(f"  --{key}: {value}")
 
     augment_flag = "--augment" if best_trial.params.get("augment", False) else ""
-    print("\n" + "*"*80)
-    print("COPY AND RUN THIS COMMAND TO TRAIN YOUR FINAL MODEL:")
-    print("*"*80 + "\n")
+    print("\n" + "*"*80 + "\nCOPY AND RUN THIS COMMAND TO TRAIN YOUR FINAL MODEL:\n" + "*"*80 + "\n")
     final_model_path = "/kaggle/working/final_model"
     final_command = f"python train_model.py --data_dir '{PROCESSED_DATA_DIR}' --use_combo_loader --stats_path '{STATS_PATH}' --model_type unet --loss tversky --tversky_alpha {best_trial.params['tversky_alpha']:.4f} --tversky_beta {1.0 - best_trial.params['tversky_alpha']:.4f} --learning_rate {best_trial.params['learning_rate']:.6f} --weight_decay {best_trial.params['weight_decay']:.6f} --batch_size {best_trial.params['batch_size']} --epochs 150 --optimizer {best_trial.params['optimizer'].lower()} --scheduler plateau --amp {augment_flag} --threshold_sweep --early_stopping_patience 20 --num_workers 4 --model_save_path '{final_model_path}'"
     print(final_command)
