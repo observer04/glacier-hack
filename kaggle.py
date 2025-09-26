@@ -1,5 +1,4 @@
-
-# kaggle.py - FULLY AUTOMATED v2 - Pre-process, Search, and Train with Stable Normalization
+# kaggle.py - FULLY AUTOMATED v3 - Optuna-controlled Augmentations
 
 print("--- Starting Fully Automated Kaggle Workflow ---")
 
@@ -17,6 +16,7 @@ import shutil
 # --- This cell assumes you have already run your setup cell to clone the repo and download data ---
 
 # --- Configuration ---
+# Paths updated for the user's Kaggle environment structure
 ORIGINAL_DATA_DIR = "/kaggle/working/Train"
 PROCESSED_DATA_DIR = "/kaggle/working/Train_processed"
 STATS_PATH = os.path.join(PROCESSED_DATA_DIR, "stats.json")
@@ -54,9 +54,10 @@ def objective(trial: optuna.trial.Trial) -> float:
     tversky_alpha = trial.suggest_float("tversky_alpha", 0.3, 0.7)
     optimizer_name = trial.suggest_categorical("optimizer", ["Adam", "SGD"])
     batch_size = trial.suggest_categorical("batch_size", [8, 16, 24])
+    augment = trial.suggest_categorical("augment", [True, False]) # Let Optuna decide
 
     train_loader, val_loader = create_segmentation_dataloaders_combo(
-        PROCESSED_DATA_DIR, batch_size=batch_size, num_workers=4, augment=True
+        PROCESSED_DATA_DIR, batch_size=batch_size, num_workers=4, augment=augment
     )
     
     model = UNet(in_channels=5, out_channels=1)
@@ -65,7 +66,6 @@ def objective(trial: optuna.trial.Trial) -> float:
       model = nn.DataParallel(model)
     model.to(device)
 
-    # Use TverskyLoss directly from train_utils if it's there, otherwise define it.
     from train_utils import TverskyLoss
     criterion = TverskyLoss(alpha=tversky_alpha, beta=(1.0-tversky_alpha))
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay) if optimizer_name == "Adam" else optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay)
@@ -76,8 +76,8 @@ def objective(trial: optuna.trial.Trial) -> float:
             model=model, train_loader=train_loader, val_loader=val_loader,
             criterion=criterion, optimizer=optimizer, num_epochs=TRIAL_EPOCHS,
             device=device, model_save_path=trial_save_path,
-            stats_path=STATS_PATH, # Use global stats for stable normalization
-            early_stopping_patience=7, use_amp=True, augment=True
+            stats_path=STATS_PATH, 
+            early_stopping_patience=7, use_amp=True, augment=augment # Pass augment flag
         )
         best_val_mcc = max(history.get("val_mcc", [0]))
         shutil.rmtree(trial_save_path, ignore_errors=True)
@@ -98,9 +98,13 @@ study.optimize(objective, n_trials=N_TRIALS)
 print("\n\n--- Optuna Search Complete ---")
 best_trial = study.best_trial
 print(f"Best trial achieved a validation MCC of: {best_trial.value:.4f}")
+
 print("\nOptimal hyperparameters found:")
 for key, value in best_trial.params.items():
     print(f"  --{key}: {value}")
+
+# Conditionally add the --augment flag based on the best trial's parameters
+augment_flag = "--augment" if best_trial.params.get("augment", False) else ""
 
 print("\n" + "*"*80)
 print("COPY AND RUN THIS COMMAND TO TRAIN YOUR FINAL MODEL:")
@@ -123,7 +127,7 @@ final_command = f"python train_model.py " \
                 f"--optimizer {best_trial.params['optimizer'].lower()} " \
                 f"--scheduler plateau " \
                 f"--amp " \
-                f"--augment " \
+                f"{augment_flag} " \
                 f"--threshold_sweep " \
                 f"--early_stopping_patience 20 " \
                 f"--num_workers 4 " \
