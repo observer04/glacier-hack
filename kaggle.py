@@ -89,56 +89,57 @@ def objective(trial: optuna.trial.Trial) -> float:
 
     return best_val_mcc
 
-study = optuna.create_study(direction="maximize")
-study.optimize(objective, n_trials=N_TRIALS)
+if __name__ == '__main__':
+    # --- STEP 1: Pre-process the dataset for speed ---
+    print("\n" + "*"*80)
+    print("STEP 1: PRE-PROCESSING DATASET FOR FASTER TRAINING")
+    print("*"*80 + "\n")
+    preprocess_command = f"python preprocess_data.py --input_dir {ORIGINAL_DATA_DIR} --output_dir {PROCESSED_DATA_DIR}"
+    os.system(preprocess_command)
+    print("\n--- Pre-processing complete. ---")
 
-# --- STEP 3: Train Final Model ---
-print("\n\n--- Optuna Search Complete ---")
-best_trial = study.best_trial
-print(f"Best trial achieved a validation MCC of: {best_trial.value:.4f}")
-print("\nOptimal hyperparameters found:")
-for key, value in best_trial.params.items():
-    print(f"  --{key}: {value}")
+    # --- STEP 2: Run Optuna Hyperparameter Search ---
+    print("\n" + "*"*80)
+    print("STEP 2: STARTING OPTUNA HYPERPARAMETER SEARCH")
+    print("This will take several hours.")
+    print("*"*80 + "\n")
 
-print("\n" + "*"*80)
-print("STEP 3: BEGINNING FINAL MODEL TRAINING WITH THE BEST PARAMETERS.")
-print("This will take several hours.")
-print("*"*80 + "\n")
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=N_TRIALS)
 
-final_model_path = os.path.join(KAGGLE_WORKING_DIR, "final_submission_assets")
+    # --- Print Final Results ---
+    print("\n\n--- Optuna Search Complete ---")
+    best_trial = study.best_trial
+    print(f"Best trial achieved a validation MCC of: {best_trial.value:.4f}")
+    print("\nOptimal hyperparameters found:")
+    for key, value in best_trial.params.items():
+        print(f"  --{key}: {value}")
 
-final_command = f"python train_model.py " \
-                f"--data_dir '{PROCESSED_DATA_DIR}' " \
-                f"--use_combo_loader " \
-                f"--model_type unet " \
-                f"--loss tversky " \
-                f"--tversky_alpha {best_trial.params['tversky_alpha']:.4f} " \
-                f"--tversky_beta {1.0 - best_trial.params['tversky_alpha']:.4f} " \
-                f"--learning_rate {best_trial.params['learning_rate']:.6f} " \
-                f"--weight_decay {best_trial.params['weight_decay']:.6f} " \
-                f"--batch_size {best_trial.params['batch_size']} " \
-                f"--epochs 150 " \
-                f"--optimizer {best_trial.params['optimizer'].lower()} " \
-                f"--scheduler plateau " \
-                f"--amp " \
-                f"--augment " \
-                f"--threshold_sweep " \
-                f"--early_stopping_patience 20 " \
-                f"--num_workers 4 " \
-                f"--model_save_path '{final_model_path}'"
+    print("\n" + "*"*80)
+    print("COPY AND RUN THIS COMMAND TO TRAIN YOUR FINAL MODEL:")
+    print("*"*80 + "\n")
 
-print("Executing final training command:\n")
-print(final_command)
-print("\n" + "-"*80 + "\n")
+    final_model_path = "/kaggle/working/final_model" # Recommended final model path
 
-os.system(final_command)
-
-print("\n" + "*"*80)
-print("WORKFLOW COMPLETE.")
-print(f"Your final model ('model.pth') is saved in: {final_model_path}")
-print("You can now download the contents of this folder for submission.")
-print("*"*80)
-
-if os.path.exists("solution.py"):
-    shutil.copy("solution.py", os.path.join(final_model_path, "solution.py"))
-    print("Copied 'solution.py' template into the final submission folder.")
+    final_command = f"python train_model.py " \
+                    f"--data_dir '{PROCESSED_DATA_DIR}' " \
+                    f"--use_combo_loader " \
+                    f"--model_type unet " \
+                    f"--loss tversky " \
+                    f"--tversky_alpha {best_trial.params['tversky_alpha']:.4f} " \
+                    f"--tversky_beta {1.0 - best_trial.params['tversky_alpha']:.4f} " \
+                    f"--learning_rate {best_trial.params['learning_rate']:.6f} " \
+                    f"--weight_decay {best_trial.params['weight_decay']:.6f} " \
+                    f"--batch_size {best_trial.params['batch_size']} " \
+                    f"--epochs 150 " \
+                    f"--optimizer {best_trial.params['optimizer'].lower()} " \
+                    f"--scheduler plateau " \
+                    f"--amp " \
+                    f"--augment " \
+                    f"--threshold_sweep " \
+                    f"--early_stopping_patience 20 " \
+                    f"--num_workers 4 " \
+                    f"--model_save_path '{final_model_path}'"
+    
+    print(final_command)
+    print("\n" + "*"*80)

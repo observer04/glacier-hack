@@ -39,27 +39,22 @@ def preprocess_dataset(input_dir, output_dir):
 
     for tid in tqdm(tile_ids, desc="Processing Tiles"):
         bands = []
-        # Find a filename that contains the tile_id
-        try:
-            fname_pattern = [f for f in os.listdir(band_dirs["Band1"]) if tid in f][0]
-        except IndexError:
-            print(f"Warning: Could not find a file for tile ID {tid} in Band1. Skipping.")
-            continue
-
         all_bands_exist = True
         for i in range(1, 6):
-            band_fname = fname_pattern.replace("B1", f"B{i}").replace("b1", f"b{i}")
-            fp = os.path.join(band_dirs[f"Band{i}"], band_fname)
-            if not os.path.exists(fp):
-                # Fallback for names like img_01_01.tif
-                fp = os.path.join(band_dirs[f"Band{i}"], fname_pattern)
-                if not os.path.exists(fp):
-                    print(f"Warning: Band {i} for tile {tid} not found. Skipping tile.")
-                    all_bands_exist = False
-                    break
-            
-            img = tifffile.imread(fp)
-            bands.append(img)
+            band_dir = band_dirs[f"Band{i}"]
+            try:
+                # Find the unique file in this directory that contains the tile ID
+                matching_files = [f for f in os.listdir(band_dir) if tid in f]
+                if not matching_files:
+                    raise IndexError
+                fname = matching_files[0]
+                fp = os.path.join(band_dir, fname)
+                img = tifffile.imread(fp)
+                bands.append(img)
+            except (IndexError, FileNotFoundError):
+                print(f"Warning: Band {i} for tile {tid} not found. Skipping tile.")
+                all_bands_exist = False
+                break
         
         if not all_bands_exist:
             continue
