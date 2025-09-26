@@ -1,141 +1,274 @@
+# ==================================================================================
+# KAGGLE.PY - SELF-CONTAINED SCRIPT FOR GLACIER SEGMENTATION
+#
+# This script includes:
+# 1. A Multi-Scale U-Net with Channel Attention.
+# 2. Data loading and pre-processing utilities.
+# 3. A full training and validation pipeline with Tversky Loss.
+# 4. Hyperparameter search using Optuna.
+# 5. Final model training using the best found parameters.
+# ==================================================================================
 
-# kaggle.py - MONOLITHIC SCRIPT V6.1 - FINAL FIX
-# All code is self-contained in this single file to eliminate import/NameError issues.
-
-print("--- Starting Monolithic Kaggle Workflow ---")
-
-# 1. Install Optuna
-!pip install optuna -q
-
-# 2. All Imports
+# --- Imports ---
 import os
-import torch
-import torch.optim as optim
-import torch.nn as nn
-import optuna
-import shutil
-import numpy as np
 import re
-from PIL import Image
+import json
+import time
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
-from tqdm import tqdm
-import random
-import json
 from sklearn.metrics import matthews_corrcoef
-import time
-import tifffile # <<< THE MISSING IMPORT
+from PIL import Image
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import optuna
+import shutil
 
-# ======================================================================================
-# SECTION 1: MODEL DEFINITION
-# ======================================================================================
-print("Defining model architectures...")
+# ==================================================================================
+# --- 1. MODEL ARCHITECTURE: Multi-Scale U-Net with Squeeze-and-Excitation ---
+# ==================================================================================
 
-class UNet(nn.Module):
-    """U-Net model for semantic segmentation of satellite imagery."""
-    def __init__(self, in_channels=5, out_channels=1):
-        super(UNet, self).__init__()
-        def _block(in_channels, out_channels):
-            return nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, 3, padding=1),
-                nn.BatchNorm2d(out_channels),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(out_channels, out_channels, 3, padding=1),
-                nn.BatchNorm2d(out_channels),
-                nn.ReLU(inplace=True)
-            )
-        self.enc1 = _block(in_channels, 64)
-        self.enc2 = _block(64, 128)
-        self.enc3 = _block(128, 256)
-        self.enc4 = _block(256, 512)
-        self.pool = nn.MaxPool2d(2)
-        self.bottleneck = _block(512, 1024)
-        self.up1 = nn.ConvTranspose2d(1024, 512, kernel_size=2, stride=2)
-        self.dec1 = _block(1024, 512)
-        self.up2 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
-        self.dec2 = _block(512, 256)
-        self.up3 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
-        self.dec3 = _block(256, 128)
-        self.up4 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
-        self.dec4 = _block(128, 64)
-        self.final = nn.Conv2d(64, out_channels, kernel_size=1)
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation Block for channel attention."""
+    def __init__(self, in_channels, reduction=8):
+        super(SEBlock, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(in_channels, in_channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels // reduction, in_channels, bias=False),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
-        enc1 = self.enc1(x)
-        enc2 = self.enc2(self.pool(enc1))
-        enc3 = self.enc3(self.pool(enc2))
-        enc4 = self.enc4(self.pool(enc3))
-        bottleneck = self.bottleneck(self.pool(enc4))
-        dec1 = self.up1(bottleneck)
-        dec1 = torch.cat((dec1, enc4), dim=1)
-        dec1 = self.dec1(dec1)
-        dec2 = self.up2(dec1)
-        dec2 = torch.cat((dec2, enc3), dim=1)
-        dec2 = self.dec2(dec2)
-        dec3 = self.up3(dec2)
-        dec3 = torch.cat((dec3, enc2), dim=1)
-        dec3 = self.dec3(dec3)
-        dec4 = self.up4(dec3)
-        dec4 = torch.cat((dec4, enc1), dim=1)
-        dec4 = self.dec4(dec4)
-        return self.final(dec4)
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
 
-# ======================================================================================
-# SECTION 2: DATA UTILITIES
-# ======================================================================================
-print("Defining data utilities...")
+class DoubleConv(nn.Module):
+    """(Convolution => BatchNorm => ReLU) * 2"""
+    def __init__(self, in_channels, out_channels, mid_channels=None):
+        super().__init__()
+        if not mid_channels:
+            mid_channels = out_channels
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
 
-def _find_label_path(label_dir: str, tile_id: str):
-    candidates = [os.path.join(label_dir, f"Y{tile_id}.tif"), os.path.join(label_dir, f"Y_output_resized_{tile_id}.tif")]
-    for p in candidates:
-        if os.path.exists(p):
-            return p
+    def forward(self, x):
+        return self.double_conv(x)
+
+class Down(nn.Module):
+    """Downscaling with MaxPool then DoubleConv"""
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.maxpool_conv = nn.Sequential(
+            nn.MaxPool2d(2),
+            DoubleConv(in_channels, out_channels)
+        )
+
+    def forward(self, x):
+        return self.maxpool_conv(x)
+
+class Up(nn.Module):
+    """Upscaling then DoubleConv"""
+    def __init__(self, in_channels, out_channels, bilinear=True):
+        super().__init__()
+        if bilinear:
+            self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+            self.conv = DoubleConv(in_channels, out_channels, in_channels // 2)
+        else:
+            self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
+            self.conv = DoubleConv(in_channels, out_channels)
+
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+        diffY = x2.size()[2] - x1.size()[2]
+        diffX = x2.size()[3] - x1.size()[3]
+        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
+        x = torch.cat([x2, x1], dim=1)
+        return self.conv(x)
+
+class OutConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(OutConv, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        return self.conv(x)
+
+class MultiScaleUNet(nn.Module):
+    """
+    A U-Net architecture that processes multi-scale inputs and uses channel attention.
+    The multi-scale input is generated internally.
+    """
+    def __init__(self, n_channels, n_classes, bilinear=True):
+        super(MultiScaleUNet, self).__init__()
+        self.n_channels = n_channels
+        self.n_classes = n_classes
+        self.bilinear = bilinear
+
+        # The input will be the original channels + downscaled-and-upscaled channels
+        self.inc = DoubleConv(n_channels * 2, 64)
+        self.se1 = SEBlock(64)
+        self.down1 = Down(64, 128)
+        self.down2 = Down(128, 256)
+        self.down3 = Down(256, 512)
+        factor = 2 if bilinear else 1
+        self.down4 = Down(512, 1024 // factor)
+        self.up1 = Up(1024, 512 // factor, bilinear)
+        self.up2 = Up(512, 256 // factor, bilinear)
+        self.up3 = Up(256, 128 // factor, bilinear)
+        self.up4 = Up(128, 64, bilinear)
+        self.outc = OutConv(64, n_classes)
+
+    def forward(self, x):
+        # Create multi-scale input on the fly
+        x_down = F.interpolate(x, scale_factor=0.5, mode='bilinear', align_corners=False)
+        x_down_up = F.interpolate(x_down, size=x.shape[2:], mode='bilinear', align_corners=False)
+        x_multi_scale = torch.cat([x, x_down_up], dim=1)
+
+        x1 = self.inc(x_multi_scale)
+        x1 = self.se1(x1)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+        x5 = self.down4(x4)
+        x = self.up1(x5, x4)
+        x = self.up2(x, x3)
+        x = self.up3(x, x2)
+        x = self.up4(x, x1)
+        logits = self.outc(x)
+        return logits
+
+# ==================================================================================
+# --- 2. DATA HANDLING UTILITIES ---
+# ==================================================================================
+
+def get_tile_id(filename):
+    """Extracts tile ID (e.g., '01_02') from a filename."""
+    match = re.search(r'(\d{2}_\d{2})', filename)
+    return match.group(1) if match else None
+
+def _find_label_path(label_dir, tile_id):
+    """Finds the path to a label file given a tile ID."""
+    # This supports multiple naming conventions for label files
+    for name in [f"Y{tile_id}.tif", f"Y_output_resized_{tile_id}.tif"]:
+        path = os.path.join(label_dir, name)
+        if os.path.exists(path):
+            return path
     return None
 
-class GlacierDatasetCombo(Dataset):
-    def __init__(self, processed_dir, is_training=True, val_split=0.2, random_state=42):
-        super().__init__()
-        self.processed_dir = processed_dir
-        self.label_dir = os.path.join(processed_dir, "label")
-        if not os.path.exists(self.label_dir):
-            raise ValueError(f"Label directory not found in {self.processed_dir}")
-        all_tile_ids = [os.path.splitext(f)[0] for f in os.listdir(processed_dir) if f.endswith(".npy")]
-        self.valid_tile_ids = [tid for tid in all_tile_ids if _find_label_path(self.label_dir, tid) is not None]
-        train_ids, val_ids = train_test_split(self.valid_tile_ids, test_size=val_split, random_state=random_state)
-        self.tile_ids = train_ids if is_training else val_ids
-        print(f"{'Training' if is_training else 'Validation'} combo dataset with {len(self.tile_ids)} tiles from {processed_dir}")
+def normalize_band(band, mean, std):
+    """Normalizes a single band using pre-computed stats."""
+    band = band.astype(np.float32)
+    if std > 0:
+        return (band - mean) / std
+    return band - mean
+
+class GlacierTileDataset(Dataset):
+    """Dataset that returns full 5-band tiles and masks for segmentation."""
+    def __init__(self, data_dir, tile_ids, global_stats, augment=False):
+        self.data_dir = data_dir
+        self.tile_ids = tile_ids
+        self.global_stats = global_stats
+        self.augment = augment
+        self.band_dirs = [os.path.join(data_dir, f"Band{i}") for i in range(1, 6)]
+        self.label_dir = os.path.join(data_dir, "label")
+
+        # Create a map of tile_id -> filename for each band
+        self.band_tile_map = {i: {} for i in range(5)}
+        for band_idx, band_dir in enumerate(self.band_dirs):
+            for f in os.listdir(band_dir):
+                if f.endswith(".tif"):
+                    tid = get_tile_id(f)
+                    if tid:
+                        self.band_tile_map[band_idx][tid] = f
 
     def __len__(self):
         return len(self.tile_ids)
 
-    def __getitem__(self, index: int):
+    def __getitem__(self, index):
         tid = self.tile_ids[index]
-        x_path = os.path.join(self.processed_dir, f"{tid}.npy")
-        x = np.load(x_path)
+        bands = []
+        for b in range(5):
+            fp = os.path.join(self.band_dirs[b], self.band_tile_map[b][tid])
+            arr = np.array(Image.open(fp))
+            if arr.ndim == 3: arr = arr[..., 0]
+            arr = np.nan_to_num(arr)
+            
+            mean, std = self.global_stats[str(b)]
+            arr = normalize_band(arr, mean, std)
+            bands.append(arr)
+        
+        x = np.stack(bands, axis=0).astype(np.float32)
+
         label_path = _find_label_path(self.label_dir, tid)
         y = np.array(Image.open(label_path))
         if y.ndim == 3: y = y[..., 0]
         y = (y > 0).astype(np.float32)
-        x = torch.from_numpy(x.copy()).permute(2, 0, 1)
-        y = torch.from_numpy(y.copy())
-        return x, y
 
-def create_segmentation_dataloaders_combo(processed_dir, batch_size=2, val_split=0.2, num_workers=4, augment: bool=False):
-    train_dataset = GlacierDatasetCombo(processed_dir, is_training=True, val_split=val_split)
-    val_dataset = GlacierDatasetCombo(processed_dir, is_training=False, val_split=val_split)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
-    return train_loader, val_loader
+        if self.augment:
+            if random.random() > 0.5: x, y = np.flip(x, axis=2).copy(), np.flip(y, axis=1).copy()
+            if random.random() > 0.5: x, y = np.flip(x, axis=1).copy(), np.flip(y, axis=0).copy()
+            k = random.randint(0, 3)
+            if k > 0: x, y = np.rot90(x, k, axes=(1, 2)).copy(), np.rot90(y, k, axes=(0, 1)).copy()
 
-# ======================================================================================
-# SECTION 3: TRAINING UTILITIES
-# ======================================================================================
-print("Defining training utilities...")
+        return torch.from_numpy(x), torch.from_numpy(y)
+
+def compute_and_save_global_stats(data_dir, stats_path, sample_ratio=0.2):
+    """Computes and saves global mean/std for each band."""
+    print("Computing global normalization statistics...")
+    band_dirs = [os.path.join(data_dir, f"Band{i}") for i in range(1, 6)]
+    all_files = []
+    for band_idx, band_dir in enumerate(band_dirs):
+        files = [os.path.join(band_dir, f) for f in os.listdir(band_dir) if f.endswith(".tif")]
+        all_files.extend([(band_idx, p) for p in files])
+    
+    random.shuffle(all_files)
+    sample_size = int(len(all_files) * sample_ratio)
+    sampled_files = all_files[:sample_size]
+    
+    band_values = {i: [] for i in range(5)}
+    for band_idx, file_path in tqdm(sampled_files, desc="Sampling files for stats"):
+        arr = np.array(Image.open(file_path))
+        valid_pixels = arr[arr > 0]
+        if len(valid_pixels) > 0:
+            band_values[band_idx].extend(valid_pixels)
+
+    global_stats = {}
+    for i in range(5):
+        values = np.array(band_values[i])
+        mean, std = np.mean(values), np.std(values)
+        # FIX: Use string keys to be consistent with JSON format
+        global_stats[str(i)] = (float(mean), float(std))
+        print(f"Band {i+1}: mean={mean:.2f}, std={std:.2f}")
+
+    with open(stats_path, 'w') as f:
+        json.dump(global_stats, f)
+    return global_stats
+
+# ==================================================================================
+# --- 3. TRAINING & VALIDATION PIPELINE ---
+# ==================================================================================
 
 class TverskyLoss(nn.Module):
+    """Tversky Loss for segmentation, good for imbalanced data."""
     def __init__(self, alpha=0.7, beta=0.3, smooth=1e-6):
         super(TverskyLoss, self).__init__()
         self.alpha, self.beta, self.smooth = alpha, beta, smooth
+
     def forward(self, y_pred, y_true):
         y_pred = torch.sigmoid(y_pred)
         y_true_pos, y_pred_pos = y_true.view(-1), y_pred.view(-1)
@@ -144,241 +277,190 @@ class TverskyLoss(nn.Module):
         false_pos = ((1 - y_true_pos) * y_pred_pos).sum()
         return 1 - (true_pos + self.smooth) / (true_pos + self.alpha * false_pos + self.beta * false_neg + self.smooth)
 
-def augment_on_gpu(images: torch.Tensor, masks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    if masks.dim() == 3: masks = masks.unsqueeze(1)
-    if random.random() > 0.5: images, masks = torch.flip(images, dims=[3]), torch.flip(masks, dims=[3])
-    if random.random() > 0.5: images, masks = torch.flip(images, dims=[2]), torch.flip(masks, dims=[2])
-    if random.random() > 0.5:
-        contrast = torch.empty(1, device=images.device).uniform_(0.8, 1.2)
-        brightness = torch.empty(1, device=images.device).uniform_(-0.1, 0.1)
-        images = images * contrast + brightness
-    if random.random() > 0.5:
-        noise = torch.randn_like(images) * 0.05
-        images = images + noise
-    images = torch.clamp(images, -5.0, 5.0)
-    return images, masks.squeeze(1)
-
-def train_epoch(model, dataloader, criterion, optimizer, device, normalizer, accum_steps: int, grad_clip: float, use_amp: bool, augment: bool):
+def train_epoch(model, loader, criterion, optimizer, device, scaler):
     model.train()
     running_loss = 0.0
-    all_preds, all_targets = [], []
-    scaler = torch.amp.GradScaler(enabled=use_amp)
-    optimizer.zero_grad()
-    for step, (inputs, targets) in enumerate(tqdm(dataloader, desc="Training")):
-        inputs, targets = inputs.to(device, non_blocking=True), targets.to(device, non_blocking=True)
-        inputs = normalizer(inputs)
-        if augment: inputs, targets = augment_on_gpu(inputs, targets)
-        with torch.amp.autocast(device_type=device, enabled=use_amp):
+    for inputs, targets in tqdm(loader, desc="Training"):
+        inputs, targets = inputs.to(device), targets.to(device, non_blocking=True)
+        optimizer.zero_grad()
+        with torch.amp.autocast("cuda", enabled=True):
             outputs = model(inputs)
             loss = criterion(outputs, targets.unsqueeze(1))
-        scaler.scale(loss / accum_steps).backward()
-        if ((step + 1) % accum_steps == 0) or (step + 1 == len(dataloader)):
-            if grad_clip > 0.0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-        running_loss += loss.item() * inputs.size(0)
-        preds_np = (torch.sigmoid(outputs) > 0.5).byte().cpu().numpy().reshape(-1)
-        targs_np = targets.byte().cpu().numpy().reshape(-1)
-        all_preds.extend(preds_np)
-        all_targets.extend(targs_np)
-    return running_loss / len(dataloader.dataset), matthews_corrcoef(all_targets, all_preds)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        running_loss += loss.item()
+    return running_loss / len(loader)
 
-def validate(model, dataloader, criterion, device, normalizer):
+def validate(model, loader, device):
     model.eval()
-    running_loss = 0.0
     all_preds, all_targets = [], []
     with torch.no_grad():
-        for inputs, targets in tqdm(dataloader, desc="Validation"):
-            inputs, targets = inputs.to(device, non_blocking=True), targets.to(device, non_blocking=True)
-            inputs = normalizer(inputs)
-            outputs = model(inputs)
-            loss = criterion(outputs, targets.unsqueeze(1))
-            running_loss += loss.item() * inputs.size(0)
-            preds_np = (torch.sigmoid(outputs) > 0.5).byte().cpu().numpy().reshape(-1)
-            targs_np = targets.byte().cpu().numpy().reshape(-1)
-            all_preds.extend(preds_np)
-            all_targets.extend(targs_np)
-    return running_loss / len(dataloader.dataset), matthews_corrcoef(all_targets, all_preds)
+        for inputs, targets in tqdm(loader, desc="Validation"):
+            inputs, targets = inputs.to(device), targets.to(device, non_blocking=True)
+            with torch.amp.autocast("cuda", enabled=True):
+                outputs = model(inputs)
+            preds = (torch.sigmoid(outputs) > 0.5).byte().cpu().numpy().flatten()
+            all_preds.extend(preds)
+            all_targets.extend(targets.byte().cpu().numpy().flatten())
+    if len(all_targets) == 0 or len(all_preds) == 0:
+        return 0.0
+    return matthews_corrcoef(all_targets, all_preds)
 
-def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, device, model_save_path, stats_path, early_stopping_patience, accum_steps, grad_clip, use_amp, augment):
-    # NOTE: GlobalNormalizer is defined inside this function to guarantee scope
-    class GlobalNormalizer(nn.Module):
-        def __init__(self, stats_path):
-            super().__init__()
-            try:
-                with open(stats_path, 'r') as f: stats = json.load(f)
-                self.mean = torch.tensor(stats['mean']).view(1, 5, 1, 1)
-                self.std = torch.tensor(stats['std']).view(1, 5, 1, 1)
-                print(f"Loaded global stats from {stats_path}")
-            except (FileNotFoundError, TypeError):
-                print(f"Warning: stats.json not found. Using fallback per-batch normalization.")
-                self.mean = None
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            x = x.float()
-            if self.mean is not None:
-                self.mean, self.std = self.mean.to(x.device), self.std.to(x.device)
-                return (x - self.mean) / (self.std + 1e-8)
-            else:
-                for i in range(x.shape[1]):
-                    channel_data = x[:, i, :, :]
-                    mean, std = channel_data.mean(), channel_data.std()
-                    x[:, i, :, :] = (channel_data - mean) / (std + 1e-8)
-                return x
+def plot_history(history, save_path):
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(history['train_loss'], label='Train Loss')
+    plt.title('Loss')
+    plt.legend()
+    plt.subplot(1, 2, 2)
+    plt.plot(history['val_mcc'], label='Validation MCC')
+    plt.title('MCC')
+    plt.legend()
+    plt.savefig(save_path)
+    plt.close()
 
-    os.makedirs(model_save_path, exist_ok=True)
-    model.to(device)
-    normalizer = GlobalNormalizer(stats_path).to(device)
+# ==================================================================================
+# --- 4. OPTUNA HYPERPARAMETER SEARCH ---
+# ==================================================================================
+
+def objective(trial, data_dir, all_tile_ids, global_stats, trial_epochs):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # --- Hyperparameters to Tune ---
+    lr = trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
+    weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-4, log=True)
+    tversky_alpha = trial.suggest_float("tversky_alpha", 0.5, 0.9)
+    batch_size = trial.suggest_categorical("batch_size", [4, 8, 16]) # Reduced batch size to prevent OOM
+    
+    # --- Data Loaders ---
+    train_ids, val_ids = train_test_split(all_tile_ids, test_size=0.2, random_state=42)
+    train_dataset = GlacierTileDataset(data_dir, train_ids, global_stats, augment=True)
+    val_dataset = GlacierTileDataset(data_dir, val_ids, global_stats, augment=False)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True, drop_last=False)
+
+    # --- Model, Loss, Optimizer ---
+    model = MultiScaleUNet(n_channels=5, n_classes=1).to(device)
+    if torch.cuda.device_count() > 1:
+        print(f"--- Using {torch.cuda.device_count()} GPUs for trial! ---")
+        model = nn.DataParallel(model)
+
+    criterion = TverskyLoss(alpha=tversky_alpha, beta=(1.0 - tversky_alpha))
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scaler = torch.cuda.amp.GradScaler()
+
+    # --- Training Loop for Trial ---
+    try:
+        best_trial_mcc = -1.0
+        for epoch in range(trial_epochs):
+            train_epoch(model, train_loader, criterion, optimizer, device, scaler)
+            val_mcc = validate(model, val_loader, device)
+            print(f"Trial {trial.number}, Epoch {epoch+1}: Val MCC = {val_mcc:.4f}")
+            if val_mcc > best_trial_mcc:
+                best_trial_mcc = val_mcc
+            trial.report(val_mcc, epoch)
+            if trial.should_prune():
+                raise optuna.exceptions.TrialPruned()
+        return best_trial_mcc
+    except torch.cuda.OutOfMemoryError:
+        print(f"--- Trial {trial.number} ran out of memory and will be pruned. ---")
+        raise optuna.exceptions.TrialPruned()
+
+# ==================================================================================
+# --- 5. MAIN EXECUTION WORKFLOW ---
+# ==================================================================================
+
+if __name__ == '__main__':
+    # --- Configuration ---
+    DATA_DIR = "/kaggle/working/Train" # Set to your training data path
+    WORK_DIR = "/kaggle/working/"
+    STATS_PATH = os.path.join(WORK_DIR, "global_stats.json")
+    
+    # Optuna settings
+    N_TRIALS = 15
+    TRIAL_EPOCHS = 20
+    
+    # Final training settings
+    FINAL_EPOCHS = 75
+    EARLY_STOPPING_PATIENCE = 10
+
+    # --- Step 1: Compute Global Stats ---
+    global_stats = None
+    if os.path.exists(STATS_PATH):
+        try:
+            with open(STATS_PATH, 'r') as f:
+                global_stats = json.load(f)
+            print("Loaded existing global stats.")
+        except json.JSONDecodeError:
+            print(f"Warning: Found corrupted '{STATS_PATH}'. Re-computing stats.")
+            
+    if global_stats is None:
+        global_stats = compute_and_save_global_stats(DATA_DIR, STATS_PATH)
+
+    # Get all valid tile IDs for splitting
+    label_dir = os.path.join(DATA_DIR, "label")
+    all_tile_ids = sorted([get_tile_id(f) for f in os.listdir(label_dir) if f.endswith(".tif")])
+    
+    # --- Step 2: Run Optuna Study ---
+    study = optuna.create_study(direction="maximize", pruner=optuna.pruners.MedianPruner())
+    study.optimize(lambda trial: objective(trial, DATA_DIR, all_tile_ids, global_stats, TRIAL_EPOCHS), n_trials=N_TRIALS)
+
+    print("\n--- Optuna Search Complete ---")
+    best_trial = study.best_trial
+    print(f"Best trial MCC: {best_trial.value:.4f}")
+    print("Best hyperparameters:", best_trial.params)
+
+    # --- Step 3: Train Final Model with Best Hyperparameters ---
+    print("\n--- Training Final Model ---")
+    
+    # Data loaders for final training
+    train_ids, val_ids = train_test_split(all_tile_ids, test_size=0.2, random_state=42)
+    final_train_dataset = GlacierTileDataset(DATA_DIR, train_ids, global_stats, augment=True)
+    final_val_dataset = GlacierTileDataset(DATA_DIR, val_ids, global_stats, augment=False)
+    final_train_loader = DataLoader(final_train_dataset, batch_size=best_trial.params['batch_size'], shuffle=True, num_workers=0, pin_memory=True, drop_last=True)
+    final_val_loader = DataLoader(final_val_dataset, batch_size=best_trial.params['batch_size'], shuffle=False, num_workers=0, pin_memory=True, drop_last=False)
+
+    # Model and optimizer
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    final_model = MultiScaleUNet(n_channels=5, n_classes=1).to(device)
+    if torch.cuda.device_count() > 1:
+        print(f"--- Using {torch.cuda.device_count()} GPUs for final training! ---")
+        final_model = nn.DataParallel(final_model)
+
+    final_criterion = TverskyLoss(alpha=best_trial.params['tversky_alpha'], beta=(1.0 - best_trial.params['tversky_alpha']))
+    final_optimizer = optim.AdamW(final_model.parameters(), lr=best_trial.params['learning_rate'], weight_decay=best_trial.params['weight_decay'])
+    final_scaler = torch.cuda.amp.GradScaler()
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(final_optimizer, 'max', factor=0.2, patience=5)
+
+    # Final training loop
     best_mcc = -1.0
     no_improve_epochs = 0
-    history = {"train_loss": [], "val_loss": [], "train_mcc": [], "val_mcc": []}
-    for epoch in range(num_epochs):
-        print(f"\nEpoch {epoch+1}/{num_epochs}")
-        start_time = time.time()
-        train_loss, train_mcc = train_epoch(model, train_loader, criterion, optimizer, device, normalizer, accum_steps, grad_clip, use_amp, augment)
-        val_loss, val_mcc = validate(model, val_loader, criterion, device, normalizer)
-        if scheduler:
-            if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau): scheduler.step(val_mcc)
-            else: scheduler.step()
-        epoch_time = time.time() - start_time
-        print(f"Train Loss: {train_loss:.4f}, MCC: {train_mcc:.4f} | Val Loss: {val_loss:.4f}, MCC: {val_mcc:.4f} | Time: {epoch_time:.2f}s")
-        history["train_loss"].append(train_loss); history["val_loss"].append(val_loss)
-        history["train_mcc"].append(train_mcc); history["val_mcc"].append(val_mcc)
+    history = {'train_loss': [], 'val_mcc': []}
+    
+    for epoch in range(FINAL_EPOCHS):
+        print(f"\nEpoch {epoch+1}/{FINAL_EPOCHS}")
+        train_loss = train_epoch(final_model, final_train_loader, final_criterion, final_optimizer, device, final_scaler)
+        val_mcc = validate(final_model, final_val_loader, device)
+        scheduler.step(val_mcc)
+        
+        print(f"Train Loss: {train_loss:.4f}, Val MCC: {val_mcc:.4f}")
+        history['train_loss'].append(train_loss)
+        history['val_mcc'].append(val_mcc)
+
         if val_mcc > best_mcc:
             best_mcc = val_mcc
-            torch.save(model.state_dict(), os.path.join(model_save_path, "best_model.pth"))
-            print(f"Saved best model with MCC: {best_mcc:.4f}")
             no_improve_epochs = 0
+            torch.save(final_model.state_dict(), os.path.join(WORK_DIR, 'best_model.pth'))
+            print(f"Saved new best model with MCC: {best_mcc:.4f}")
         else:
             no_improve_epochs += 1
-        if no_improve_epochs >= early_stopping_patience:
-            print(f"Early stopping after {epoch+1} epochs")
+            print(f"No improvement for {no_improve_epochs} epochs.")
+
+        if no_improve_epochs >= EARLY_STOPPING_PATIENCE:
+            print("Early stopping triggered.")
             break
-    model.load_state_dict(torch.load(os.path.join(model_save_path, "best_model.pth")))
-    return model, history
-
-# ======================================================================================
-# SECTION 4: MAIN EXECUTION BLOCK
-# ======================================================================================
-print("Defining main execution block...")
-
-# --- Configuration ---
-ORIGINAL_DATA_DIR = "/kaggle/working/Train"
-PROCESSED_DATA_DIR = "/kaggle/working/Train_processed"
-STATS_PATH = os.path.join(PROCESSED_DATA_DIR, "stats.json")
-KAGGLE_WORKING_DIR = "/kaggle/working/"
-N_TRIALS = 15
-TRIAL_EPOCHS = 30
-
-# --- Preprocessing Function ---
-def get_tile_id_preprocess(filename):
-    match = re.search(r'(\d{2}_\d{2})', filename)
-    return match.group(1) if match else None
-
-def run_preprocessing(input_dir, output_dir):
-    print("\n" + "*"*80 + "\nSTEP 1: PRE-PROCESSING DATASET FOR FASTER TRAINING\n" + "*"*80 + "\n")
-    os.makedirs(output_dir, exist_ok=True)
-    band_dirs = {f"Band{i}": os.path.join(input_dir, f"Band{i}") for i in range(1, 6)}
-    tile_ids = sorted(list(set(tid for f in os.listdir(band_dirs["Band1"]) if (tid := get_tile_id_preprocess(f)) is not None)))
-    print(f"Found {len(tile_ids)} unique tiles to process.")
-
-    print("--- Pass 1: Computing Global Statistics ---")
-    channel_sums, channel_sq_sums, pixel_counts = np.zeros(5, dtype=np.float64), np.zeros(5, dtype=np.float64), np.zeros(5, dtype=np.int64)
-    for tid in tqdm(tile_ids, desc="Calculating Stats"):
-        for i in range(1, 6):
-            try:
-                matching_files = [f for f in os.listdir(band_dirs[f"Band{i}"]) if tid in f]
-                if not matching_files: raise IndexError
-                img = tifffile.imread(os.path.join(band_dirs[f"Band{i}"], matching_files[0])).astype(np.float64)
-                valid_pixels = img[img > 0]
-                if valid_pixels.size > 0:
-                    channel_sums[i-1] += valid_pixels.sum(); channel_sq_sums[i-1] += (valid_pixels**2).sum(); pixel_counts[i-1] += valid_pixels.size
-            except (IndexError, FileNotFoundError): continue
-    mean = channel_sums / pixel_counts
-    std = np.sqrt((channel_sq_sums / pixel_counts) - (mean**2))
-    stats = {'mean': mean.tolist(), 'std': std.tolist()}
-    with open(STATS_PATH, 'w') as f: json.dump(stats, f)
-    print(f"Global stats saved to {STATS_PATH}")
-
-    print("--- Pass 2: Saving Combined .npy Files ---")
-    for tid in tqdm(tile_ids, desc="Processing Tiles"):
-        bands = []
-        all_bands_exist = True
-        for i in range(1, 6):
-            try:
-                matching_files = [f for f in os.listdir(band_dirs[f"Band{i}"]) if tid in f]
-                if not matching_files: raise IndexError
-                bands.append(tifffile.imread(os.path.join(band_dirs[f"Band{i}"], matching_files[0])))
-            except (IndexError, FileNotFoundError): all_bands_exist = False; break
-        if not all_bands_exist: continue
-        np.save(os.path.join(output_dir, f"{tid}.npy"), np.stack(bands, axis=-1).astype(np.int16))
-    
-    input_label_dir, output_label_dir = os.path.join(input_dir, "label"), os.path.join(output_dir, "label")
-    if os.path.exists(input_label_dir): shutil.copytree(input_label_dir, output_label_dir, dirs_exist_ok=True)
-    print("\n--- Pre-processing complete. ---")
-
-# --- Optuna Objective ---
-def objective(trial: optuna.trial.Trial) -> float:
-    print(f"\n--- Starting Trial {trial.number} ---")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    lr = trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)
-    weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
-    tversky_alpha = trial.suggest_float("tversky_alpha", 0.4, 0.6)
-    optimizer_name = trial.suggest_categorical("optimizer", ["Adam"])
-    batch_size = trial.suggest_categorical("batch_size", [8, 16])
-    augment = trial.suggest_categorical("augment", [True, False])
-
-    train_loader, val_loader = create_segmentation_dataloaders_combo(PROCESSED_DATA_DIR, batch_size=batch_size, num_workers=2)
-    model = UNet(in_channels=5, out_channels=1)
-    if torch.cuda.device_count() > 1: model = nn.DataParallel(model)
-    model.to(device)
-
-    criterion = TverskyLoss(alpha=tversky_alpha, beta=(1.0-tversky_alpha))
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', factor=0.5, patience=5)
-
-    try:
-        trial_save_path = os.path.join(KAGGLE_WORKING_DIR, f"optuna_trial_{trial.number}")
-        _, history = train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, TRIAL_EPOCHS, device, trial_save_path, STATS_PATH, 10, 1, 0.0, True, augment)
-        best_val_mcc = max(history.get("val_mcc", [0.0]))
-        shutil.rmtree(trial_save_path, ignore_errors=True)
-    except RuntimeError as e:
-        if "out of memory" in str(e).lower(): raise optuna.exceptions.TrialPruned()
-        else: raise e
-    return best_val_mcc
-
-# --- Main Runner ---
-if __name__ == '__main__':
-    run_preprocessing(ORIGINAL_DATA_DIR, PROCESSED_DATA_DIR)
-    study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=N_TRIALS)
-
-    print("\n\n--- Optuna Search Complete ---")
-    best_trial = study.best_trial
-    print(f"Best trial achieved a validation MCC of: {best_trial.value:.4f}")
-    print("\nOptimal hyperparameters found:")
-    for key, value in best_trial.params.items(): print(f"  --{key}: {value}")
-
-    augment_flag = "--augment" if best_trial.params.get("augment", False) else ""
-    print("\n" + "*"*80 + "\nCOPY AND RUN THIS COMMAND TO TRAIN YOUR FINAL MODEL:\n" + "*"*80 + "\n")
-    final_model_path = "/kaggle/working/final_model"
-    final_command = f"python train_model.py --data_dir '{PROCESSED_DATA_DIR}' --use_combo_loader --stats_path '{STATS_PATH}' --model_type unet --loss tversky --tversky_alpha {best_trial.params['tversky_alpha']:.4f} --tversky_beta {1.0 - best_trial.params['tversky_alpha']:.4f} --learning_rate {best_trial.params['learning_rate']:.6f} --weight_decay {best_trial.params['weight_decay']:.6f} --batch_size {best_trial.params['batch_size']} --epochs 150 --optimizer {best_trial.params['optimizer'].lower()} --scheduler plateau --amp {augment_flag} --threshold_sweep --early_stopping_patience 20 --num_workers 4 --model_save_path '{final_model_path}'"
-    print(final_command)
-    print("\n" + "*"*80)
-
-    # Save the final command to a shell script for easy execution in a new cell
-    script_path = "/kaggle/working/run_final_training.sh"
-    with open(script_path, 'w') as f:
-        f.write("#!/bin/bash\n")
-        # Ensure the script runs from the correct project directory
-        f.write("cd /kaggle/working/glacier-hack\n") 
-        # Use python3 for robustness and execute the command
-        f.write(final_command)
-
-    # Make the script executable
-    os.chmod(script_path, 0o755)
-
-    print(f"A script to run the final training has been saved to: {script_path}")
-    print("You can now run the next cell in your notebook to execute it.")
+            
+    # --- Step 4: Save Artifacts ---
+    plot_history(history, os.path.join(WORK_DIR, "training_history.png"))
+    print(f"\nFinal model and training history saved in {WORK_DIR}")

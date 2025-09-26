@@ -1,4 +1,4 @@
-# pip install torch torchvision numpy pillow tifffile scikit-learn tqdm
+# pip install torch torchvision pillow tifffile numpy
 
 import os
 import re
@@ -9,217 +9,242 @@ import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 import tifffile
+from collections import OrderedDict
 
-from models import UNet, EfficientUNet, DeepLabV3Plus
+# ==================================================================================
+# --- Model Architecture ---
+# ==================================================================================
 
-# --- Model Definition ---
+class SEBlock(nn.Module):
+    def __init__(self, in_channels, reduction=8):
+        super(SEBlock, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(in_channels, in_channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels // reduction, in_channels, bias=False),
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
 
-def get_model():
-    """Load the best available trained model with priority order."""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Priority order: EfficientUNet > UNet > DeepLabV3Plus
-    # Check both local and Google Drive paths
-    model_paths = [
-        ("model.pth", None),  # Main submission model
-        ("/content/drive/MyDrive/glacier_hack/model.pth", None),  # Google Drive submission model
-        ("/content/drive/MyDrive/glacier_hack/models/efficientunet_tversky/efficientunet_best.pth", "efficientunet"),
-        ("/content/drive/MyDrive/glacier_hack/models/multiscale_efficientunet/efficientunet_multiscale_best.pth", "efficientunet"),
-        ("/content/drive/MyDrive/glacier_hack/models/ensemble_full/model_0_efficientunet_best.pth", "efficientunet"),
-        ("models/efficientunet_tversky/efficientunet_best.pth", "efficientunet"),
-        ("models/multiscale_efficientunet/efficientunet_multiscale_best.pth", "efficientunet"),
-        ("models/ensemble_full/model_0_efficientunet_best.pth", "efficientunet"),
-        ("models/unet_adaptive/unet_best.pth", "unet"),
-        ("models/deeplabv3plus_boundary/deeplabv3plus_best.pth", "deeplabv3plus"),
-    ]
-    
-    for model_path, model_type in model_paths:
-        if os.path.exists(model_path):
-            print(f"Found model: {model_path}")
-            
-            # Determine model type from path if not specified
-            if model_type is None:
-                if "efficientunet" in model_path.lower():
-                    model_type = "efficientunet"
-                elif "deeplabv3" in model_path.lower():
-                    model_type = "deeplabv3plus"
-                else:
-                    model_type = "unet"  # default
-            
-            # Create model
-            if model_type == "efficientunet":
-                model = EfficientUNet(in_channels=5, out_channels=1)
-            elif model_type == "deeplabv3plus":
-                model = DeepLabV3Plus(in_channels=5, out_channels=1)
-            else:
-                model = UNet(in_channels=5, out_channels=1)
-            
-            # Load weights
-            try:
-                checkpoint = torch.load(model_path, map_location=device)
-                if 'model_state_dict' in checkpoint:
-                    model.load_state_dict(checkpoint['model_state_dict'])
-                    print(f"Loaded checkpoint with MCC: {checkpoint.get('best_mcc', 'unknown')}")
-                else:
-                    model.load_state_dict(checkpoint)
-                
-                model.to(device)
-                model.eval()
-                return model, model_type
-                
-            except Exception as e:
-                print(f"Failed to load {model_path}: {e}")
-                continue
-    
-    # Fallback to default UNet if no models found
-    print("No pre-trained models found, using default UNet")
-    model = UNet(in_channels=5, out_channels=1)
-    model.to(device)
-    model.eval()
-    return model, "unet"
+class DoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels, mid_channels=None):
+        super().__init__()
+        if not mid_channels:
+            mid_channels = out_channels
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+    def forward(self, x):
+        return self.double_conv(x)
 
-# --- Dataset Definition ---
+class Down(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.maxpool_conv = nn.Sequential(nn.MaxPool2d(2), DoubleConv(in_channels, out_channels))
+    def forward(self, x):
+        return self.maxpool_conv(x)
 
-def normalize_band(band, global_stats=None):
-    """Normalize a single band using mean and std."""
-    band = band.astype(np.float32)
-    
-    if global_stats is not None:
-        mean, std = global_stats
-        if std > 0:
-            return (band - mean) / std
-        return band - mean
-    else:
-        # Fallback to per-tile normalization
-        mean = np.mean(band)
-        std = np.std(band)
-        if std > 0:
-            return (band - mean) / std
-        return band
+class Up(nn.Module):
+    def __init__(self, in_channels, out_channels, bilinear=True):
+        super().__init__()
+        if bilinear:
+            self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+            self.conv = DoubleConv(in_channels, out_channels, in_channels // 2)
+        else:
+            self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
+            self.conv = DoubleConv(in_channels, out_channels)
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+        diffY = x2.size()[2] - x1.size()[2]
+        diffX = x2.size()[3] - x1.size()[3]
+        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
+        x = torch.cat([x2, x1], dim=1)
+        return self.conv(x)
 
-# Pre-computed global statistics (computed from training data)
+class OutConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(OutConv, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+    def forward(self, x):
+        return self.conv(x)
+
+class MultiScaleUNet(nn.Module):
+    def __init__(self, n_channels, n_classes, bilinear=True):
+        super(MultiScaleUNet, self).__init__()
+        self.n_channels = n_channels
+        self.n_classes = n_classes
+        self.bilinear = bilinear
+        self.inc = DoubleConv(n_channels * 2, 64)
+        self.se1 = SEBlock(64)
+        self.down1 = Down(64, 128)
+        self.down2 = Down(128, 256)
+        self.down3 = Down(256, 512)
+        factor = 2 if bilinear else 1
+        self.down4 = Down(512, 1024 // factor)
+        self.up1 = Up(1024, 512 // factor, bilinear)
+        self.up2 = Up(512, 256 // factor, bilinear)
+        self.up3 = Up(256, 128 // factor, bilinear)
+        self.up4 = Up(128, 64, bilinear)
+        self.outc = OutConv(64, n_classes)
+    def forward(self, x):
+        x_down = F.interpolate(x, scale_factor=0.5, mode='bilinear', align_corners=False)
+        x_down_up = F.interpolate(x_down, size=x.shape[2:], mode='bilinear', align_corners=False)
+        x_multi_scale = torch.cat([x, x_down_up], dim=1)
+        x1 = self.inc(x_multi_scale)
+        x1 = self.se1(x1)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+        x5 = self.down4(x4)
+        x = self.up1(x5, x4)
+        x = self.up2(x, x3)
+        x = self.up3(x, x2)
+        x = self.up4(x, x1)
+        logits = self.outc(x)
+        return logits
+
+# ==================================================================================
+# --- Inference Dataset and Utilities ---
+# ==================================================================================
+
+# Normalization stats from our training run
 GLOBAL_STATS = {
-    0: (1842.5, 456.2),  # Band1 (Blue)
-    1: (1654.3, 398.7),  # Band2 (Green) 
-    2: (1423.8, 367.9),  # Band3 (Red)
-    3: (2156.7, 512.4),  # Band4 (SWIR)
-    4: (287.6, 8.3),     # Band5 (TIR)
+    "0": (31920.07, 20553.20),
+    "1": (27754.48, 20273.15),
+    "2": (31145.41, 21443.17),
+    "3": (8874.63, 2982.37),
+    "4": (32289.35, 2997.46)
 }
 
+def normalize_band(band, mean, std):
+    band = band.astype(np.float32)
+    if std > 0:
+        return (band - mean) / std
+    return band - mean
+
 class GlacierTestDataset(Dataset):
-    def __init__(self, imagepath):
-        self.imagepath = imagepath
-        self.band_dirs = self.imagepath
+    def __init__(self, imagepath_dict):
+        self.imagepath_dict = imagepath_dict
+        self.band_dirs = self.imagepath_dict
         
-        self.band_tile_map = {f"Band{i}": {} for i in range(1, 6)}
-        self.tile_ids = []
-
-        for i in range(1, 6):
-            band_name = f"Band{i}"
-            band_dir = self.band_dirs[band_name]
-            for f in os.listdir(band_dir):
-                if f.endswith(".tif"):
-                    match = re.search(r"(\d{2}_\d{2})", f)
-                    if match:
-                        tile_id = match.group(1)
-                        if tile_id not in self.tile_ids:
-                            self.tile_ids.append(tile_id)
-                        self.band_tile_map[band_name][tile_id] = f
-
+        # Find all unique tile IDs from Band1
+        self.tile_files = sorted(os.listdir(self.band_dirs["Band1"]))
+        
     def __len__(self):
-        return len(self.tile_ids)
+        return len(self.tile_files)
 
     def __getitem__(self, idx):
-        tile_id = self.tile_ids[idx]
+        tile_filename = self.tile_files[idx]
         
         bands = []
         for i in range(1, 6):
             band_name = f"Band{i}"
-            filename = self.band_tile_map[band_name][tile_id]
-            band_file = os.path.join(self.band_dirs[band_name], filename)
+            band_file = os.path.join(self.band_dirs[band_name], tile_filename)
             arr = tifffile.imread(band_file)
             
-            # Use global normalization if available
-            band_idx = i - 1  # Convert to 0-based index
-            global_stats = GLOBAL_STATS.get(band_idx)
-            arr = normalize_band(arr, global_stats)
+            mean, std = GLOBAL_STATS[str(i-1)]
+            arr = normalize_band(arr, mean, std)
             bands.append(arr)
         
-        image = np.stack(bands, axis=0).astype(np.float32) # Stack on axis=0 for (C, H, W)
+        image = np.stack(bands, axis=0).astype(np.float32)
+        return torch.from_numpy(image), tile_filename
 
-        return image, self.band_tile_map["Band1"][tile_id]
-
-# --- Main Prediction Function ---
+# ==================================================================================
+# --- Main Inference Function ---
+# ==================================================================================
 
 def tta_predict(model, x):
     """Test-Time Augmentation for more robust predictions."""
+    x = x.to(next(model.parameters()).device)
     predictions = []
     
     # Original
     with torch.no_grad():
         pred = torch.sigmoid(model(x))
-        predictions.append(pred)
-        
-        # Horizontal flip
-        pred_hflip = torch.sigmoid(model(torch.flip(x, dims=[3])))
-        pred_hflip = torch.flip(pred_hflip, dims=[3])
-        predictions.append(pred_hflip)
-        
-        # Vertical flip
-        pred_vflip = torch.sigmoid(model(torch.flip(x, dims=[2])))
-        pred_vflip = torch.flip(pred_vflip, dims=[2])
-        predictions.append(pred_vflip)
-        
-        # Horizontal + Vertical flip
-        pred_hvflip = torch.sigmoid(model(torch.flip(x, dims=[2, 3])))
-        pred_hvflip = torch.flip(pred_hvflip, dims=[2, 3])
-        predictions.append(pred_hvflip)
+    predictions.append(pred)
     
-    # Average predictions
+    # Horizontal flip
+    with torch.no_grad():
+        pred_hflip = torch.sigmoid(model(torch.flip(x, dims=[3])))
+    predictions.append(torch.flip(pred_hflip, dims=[3]))
+    
+    # Vertical flip
+    with torch.no_grad():
+        pred_vflip = torch.sigmoid(model(torch.flip(x, dims=[2])))
+    predictions.append(torch.flip(pred_vflip, dims=[2]))
+    
     return torch.stack(predictions).mean(dim=0)
 
 def maskgeration(imagepath, out_dir):
+    """
+    Loads the trained model and generates segmentation masks for the test dataset.
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # --- Model Loading ---
+    model = MultiScaleUNet(n_channels=5, n_classes=1)
     
+    # Load the state dict, handling the 'module.' prefix from DataParallel
+    try:
+        state_dict = torch.load("model.pth", map_location=device)
+        if next(iter(state_dict)).startswith('module.'):
+            print("Loading DataParallel model.")
+            new_state_dict = OrderedDict()
+            for k, v in state_dict.items():
+                name = k[7:] # remove 'module.'
+                new_state_dict[name] = v
+            model.load_state_dict(new_state_dict)
+        else:
+            print("Loading standard model.")
+            model.load_state_dict(state_dict)
+    except FileNotFoundError:
+        print("ERROR: model.pth not found. Please ensure the model weights file is in the same directory.")
+        return
+
+    model.to(device)
+    model.eval()
+
     # --- Data Loading ---
     dataset = GlacierTestDataset(imagepath)
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=2)
+    # Use num_workers=0 in submission environments for reliability
+    dataloader = DataLoader(dataset, batch_size=4, shuffle=False, num_workers=0) 
     
-    # --- Model Loading ---
-    model, model_type = get_model()
-    print(f"Using {model_type} model")
-    
-    # --- Prediction with TTA ---
+    # --- Prediction Loop ---
     os.makedirs(out_dir, exist_ok=True)
     
-    # Use TTA for better predictions
-    use_tta = True
-    # Adaptive threshold based on model type (from training experience)
-    if model_type == "efficientunet":
-        threshold = 0.55  # EfficientUNet typically works better with slightly higher threshold
-    else:
-        threshold = 0.5
-        
-    print(f"Using threshold: {threshold}, TTA: {use_tta}")
-    
+    threshold = 0.5 # Use a standard 0.5 threshold for submission
+    print(f"Starting prediction with threshold: {threshold}")
+
     with torch.no_grad():
-        for images, image_files in dataloader:
+        for images, filenames in dataloader:
             images = images.to(device)
             
-            if use_tta:
-                preds = tta_predict(model, images).cpu().numpy()
-            else:
-                outputs = model(images)
-                preds = torch.sigmoid(outputs).cpu().numpy()
+            # Use Test-Time Augmentation
+            preds = tta_predict(model, images).cpu().numpy()
             
             for i in range(preds.shape[0]):
                 pred_mask = (preds[i, 0] > threshold).astype(np.uint8) * 255
                 mask_image = Image.fromarray(pred_mask)
-                mask_image.save(os.path.join(out_dir, image_files[i]))
+                mask_image.save(os.path.join(out_dir, filenames[i]))
+    
+    print("Prediction complete.")
 
-# --- Main Function (as provided in the instructions) ---
 
-# Do not update this section
+# ==================================================================================
+# --- Boilerplate Main Function (Do Not Modify) ---
+# ==================================================================================
+
 def main():
     import argparse
     parser = argparse.ArgumentParser()
@@ -228,7 +253,6 @@ def main():
     parser.add_argument("--out", required=True, help="Path to output predictions")
     args = parser.parse_args()
 
-    # Build band → folder map
     imagepath = {}
     for band in os.listdir(args.data):
         band_path = os.path.join(args.data, band)
@@ -236,8 +260,6 @@ def main():
             imagepath[band] = band_path
 
     print(f"Processing bands: {list(imagepath.keys())}")
-
-    # Run mask generation and save predictions
     maskgeration(imagepath, args.out)
 
 if __name__ == "__main__":
