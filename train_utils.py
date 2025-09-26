@@ -76,7 +76,11 @@ class TverskyLoss(nn.Module):
         self.alpha, self.beta, self.smooth = alpha, beta, smooth
 
     def forward(self, y_pred, y_true):
-        y_true_pos, y_pred_pos = y_true.view(-1), y_pred.view(-1)
+        # Apply sigmoid to convert logits to probabilities
+        y_pred = torch.sigmoid(y_pred)
+
+        y_true_pos = y_true.view(-1)
+        y_pred_pos = y_pred.view(-1)
         true_pos = (y_true_pos * y_pred_pos).sum()
         false_neg = (y_true_pos * (1 - y_pred_pos)).sum()
         false_pos = ((1 - y_true_pos) * y_pred_pos).sum()
