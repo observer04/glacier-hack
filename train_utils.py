@@ -1,5 +1,6 @@
-# train_utils.py - High-Performance Version v2
-# Normalization and Augmentation are performed on the GPU and are flag-controlled.
+
+# train_utils.py - High-Performance Version v3.1
+# Uses stable, global statistics for GPU-side normalization.
 
 import os
 import time
@@ -10,23 +11,36 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from sklearn.metrics import matthews_corrcoef, f1_score, precision_score, recall_score
+from sklearn.metrics import matthews_corrcoef
 import random
 import json
 
-# --- GPU-Side Data Processing Functions ---
-def normalize_on_gpu(x: torch.Tensor) -> torch.Tensor:
-    """Normalizes a batch of images on the GPU, channel-wise."""
-    x = x.float()
-    for i in range(x.shape[1]):
-        channel_data = x[:, i, :, :]
-        mean = channel_data.mean()
-        std = channel_data.std()
-        if std > 0:
-            x[:, i, :, :] = (channel_data - mean) / std
+class GlobalNormalizer(nn.Module):
+    """Applies stable normalization using pre-calculated global stats."""
+    def __init__(self, stats_path):
+        super().__init__()
+        try:
+            with open(stats_path, 'r') as f:
+                stats = json.load(f)
+            self.mean = torch.tensor(stats['mean']).view(1, 5, 1, 1)
+            self.std = torch.tensor(stats['std']).view(1, 5, 1, 1)
+            print(f"Loaded global stats from {stats_path}")
+        except (FileNotFoundError, TypeError):
+            print(f"Warning: stats.json not found or invalid. Using fallback per-batch normalization.")
+            self.mean = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.float()
+        if self.mean is not None:
+            self.mean = self.mean.to(x.device)
+            self.std = self.std.to(x.device)
+            return (x - self.mean) / (self.std + 1e-8)
         else:
-            x[:, i, :, :] = channel_data - mean
-    return x
+            for i in range(x.shape[1]):
+                channel_data = x[:, i, :, :]
+                mean, std = channel_data.mean(), channel_data.std()
+                x[:, i, :, :] = (channel_data - mean) / (std + 1e-8)
+            return x
 
 def augment_on_gpu(images: torch.Tensor, masks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Applies random augmentations to a batch of images and masks on the GPU."""
@@ -38,7 +52,6 @@ def augment_on_gpu(images: torch.Tensor, masks: torch.Tensor) -> tuple[torch.Ten
     if random.random() > 0.5:
         images, masks = torch.flip(images, dims=[2]), torch.flip(masks, dims=[2])
 
-    # Using the original, more aggressive augmentations as requested
     if random.random() > 0.5:
         contrast = torch.empty(1, device=images.device).uniform_(0.8, 1.2)
         brightness = torch.empty(1, device=images.device).uniform_(-0.1, 0.1)
@@ -50,14 +63,12 @@ def augment_on_gpu(images: torch.Tensor, masks: torch.Tensor) -> tuple[torch.Ten
     images = torch.clamp(images, -5.0, 5.0)
     return images, masks.squeeze(1)
 
-# --- Loss Functions ---
 class TverskyLoss(nn.Module):
     def __init__(self, alpha=0.7, beta=0.3, smooth=1e-6):
         super(TverskyLoss, self).__init__()
         self.alpha, self.beta, self.smooth = alpha, beta, smooth
 
     def forward(self, y_pred, y_true):
-        # Apply sigmoid to convert logits to probabilities
         y_pred = torch.sigmoid(y_pred)
         y_true_pos, y_pred_pos = y_true.view(-1), y_pred.view(-1)
         true_pos = (y_true_pos * y_pred_pos).sum()
@@ -65,7 +76,6 @@ class TverskyLoss(nn.Module):
         false_pos = ((1 - y_true_pos) * y_pred_pos).sum()
         return 1 - (true_pos + self.smooth) / (true_pos + self.alpha * false_pos + self.beta * false_neg + self.smooth)
 
-# --- Core Training & Validation Loops ---
 def train_epoch(model, dataloader, criterion, optimizer, device, normalizer, accum_steps: int, grad_clip: float, use_amp: bool, augment: bool):
     model.train()
     running_loss = 0.0
@@ -126,15 +136,15 @@ def validate(model, dataloader, criterion, device, normalizer):
 def train_model(model, train_loader, val_loader, criterion, optimizer, 
                scheduler=None, num_epochs=50, device="cuda", 
                model_save_path="models", early_stopping_patience=10,
-               stats_path: str = None, # Path to stats.json
+               stats_path: str = None, normalizer_class=None, # Dependency Injection
                accum_steps: int = 1, grad_clip: float = 0.0,
                use_amp: bool = False, augment: bool = False):
-    
-    # --- GPU-Side Data Processing Functions ---
-
     os.makedirs(model_save_path, exist_ok=True)
     model = model.to(device)
-    normalizer = GlobalNormalizer(stats_path).to(device)
+    
+    if normalizer_class is None:
+        raise ValueError("normalizer_class must be provided.")
+    normalizer = normalizer_class(stats_path).to(device)
 
     best_mcc = -1.0
     best_model_path = os.path.join(model_save_path, "best_model.pth")
