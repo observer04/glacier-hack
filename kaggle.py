@@ -367,3 +367,18 @@ if __name__ == '__main__':
     final_command = f"python train_model.py --data_dir '{PROCESSED_DATA_DIR}' --use_combo_loader --stats_path '{STATS_PATH}' --model_type unet --loss tversky --tversky_alpha {best_trial.params['tversky_alpha']:.4f} --tversky_beta {1.0 - best_trial.params['tversky_alpha']:.4f} --learning_rate {best_trial.params['learning_rate']:.6f} --weight_decay {best_trial.params['weight_decay']:.6f} --batch_size {best_trial.params['batch_size']} --epochs 150 --optimizer {best_trial.params['optimizer'].lower()} --scheduler plateau --amp {augment_flag} --threshold_sweep --early_stopping_patience 20 --num_workers 4 --model_save_path '{final_model_path}'"
     print(final_command)
     print("\n" + "*"*80)
+
+    # Save the final command to a shell script for easy execution in a new cell
+    script_path = "/kaggle/working/run_final_training.sh"
+    with open(script_path, 'w') as f:
+        f.write("#!/bin/bash\n")
+        # Ensure the script runs from the correct project directory
+        f.write("cd /kaggle/working/glacier-hack\n") 
+        # Use python3 for robustness and execute the command
+        f.write(final_command)
+
+    # Make the script executable
+    os.chmod(script_path, 0o755)
+
+    print(f"A script to run the final training has been saved to: {script_path}")
+    print("You can now run the next cell in your notebook to execute it.")
