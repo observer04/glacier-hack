@@ -1,7 +1,5 @@
-
-
-# train_utils.py - High-Performance Version v3
-# Uses stable, global statistics for GPU-side normalization.
+# train_utils.py - High-Performance Version v2
+# Normalization and Augmentation are performed on the GPU and are flag-controlled.
 
 import os
 import time
@@ -12,41 +10,23 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from sklearn.metrics import matthews_corrcoef
+from sklearn.metrics import matthews_corrcoef, f1_score, precision_score, recall_score
 import random
 import json
 
 # --- GPU-Side Data Processing Functions ---
-class GlobalNormalizer(nn.Module):
-    """Applies stable normalization using pre-calculated global stats."""
-    def __init__(self, stats_path):
-        super().__init__()
-        try:
-            with open(stats_path, 'r') as f:
-                stats = json.load(f)
-            # Reshape for broadcasting: (C) -> (1, C, 1, 1)
-            self.mean = torch.tensor(stats['mean']).view(1, 5, 1, 1)
-            self.std = torch.tensor(stats['std']).view(1, 5, 1, 1)
-            print(f"Loaded global stats from {stats_path}")
-        except FileNotFoundError:
-            print(f"Warning: stats.json not found at {stats_path}. Using fallback per-batch normalization.")
-            self.mean = None
-            self.std = None
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.float()
-        if self.mean is not None:
-            # Use global stats
-            self.mean = self.mean.to(x.device)
-            self.std = self.std.to(x.device)
-            return (x - self.mean) / (self.std + 1e-8)
+def normalize_on_gpu(x: torch.Tensor) -> torch.Tensor:
+    """Normalizes a batch of images on the GPU, channel-wise."""
+    x = x.float()
+    for i in range(x.shape[1]):
+        channel_data = x[:, i, :, :]
+        mean = channel_data.mean()
+        std = channel_data.std()
+        if std > 0:
+            x[:, i, :, :] = (channel_data - mean) / std
         else:
-            # Fallback to per-batch normalization (less stable)
-            for i in range(x.shape[1]):
-                channel_data = x[:, i, :, :]
-                mean, std = channel_data.mean(), channel_data.std()
-                x[:, i, :, :] = (channel_data - mean) / (std + 1e-8)
-            return x
+            x[:, i, :, :] = channel_data - mean
+    return x
 
 def augment_on_gpu(images: torch.Tensor, masks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Applies random augmentations to a batch of images and masks on the GPU."""
@@ -58,6 +38,7 @@ def augment_on_gpu(images: torch.Tensor, masks: torch.Tensor) -> tuple[torch.Ten
     if random.random() > 0.5:
         images, masks = torch.flip(images, dims=[2]), torch.flip(masks, dims=[2])
 
+    # Using the original, more aggressive augmentations as requested
     if random.random() > 0.5:
         contrast = torch.empty(1, device=images.device).uniform_(0.8, 1.2)
         brightness = torch.empty(1, device=images.device).uniform_(-0.1, 0.1)
@@ -78,9 +59,7 @@ class TverskyLoss(nn.Module):
     def forward(self, y_pred, y_true):
         # Apply sigmoid to convert logits to probabilities
         y_pred = torch.sigmoid(y_pred)
-
-        y_true_pos = y_true.view(-1)
-        y_pred_pos = y_pred.view(-1)
+        y_true_pos, y_pred_pos = y_true.view(-1), y_pred.view(-1)
         true_pos = (y_true_pos * y_pred_pos).sum()
         false_neg = (y_true_pos * (1 - y_pred_pos)).sum()
         false_pos = ((1 - y_true_pos) * y_pred_pos).sum()
