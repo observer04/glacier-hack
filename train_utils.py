@@ -129,6 +129,9 @@ def train_model(model, train_loader, val_loader, criterion, optimizer,
                stats_path: str = None, # Path to stats.json
                accum_steps: int = 1, grad_clip: float = 0.0,
                use_amp: bool = False, augment: bool = False):
+    
+    # --- GPU-Side Data Processing Functions ---
+
     os.makedirs(model_save_path, exist_ok=True)
     model = model.to(device)
     normalizer = GlobalNormalizer(stats_path).to(device)
