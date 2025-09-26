@@ -71,6 +71,13 @@ class GlacierDatasetCombo(Dataset):
         x_path = os.path.join(self.processed_dir, f"{tid}.npy")
         x = np.load(x_path)
 
+        # Load the label
+        label_path = _find_label_path(self.label_dir, tid)
+        y = np.array(Image.open(label_path))
+        if y.ndim == 3:
+            y = y[..., 0]
+        y = (y > 0).astype(np.float32)
+
         # Convert to tensors. Augmentation and Normalization will be done on the GPU.
         x = torch.from_numpy(x.copy()).permute(2, 0, 1) # (H, W, C) -> (C, H, W)
         y = torch.from_numpy(y.copy()) # (H, W)
