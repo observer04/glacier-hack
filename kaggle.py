@@ -16,8 +16,9 @@ import shutil
 # --- This cell assumes you have already run your setup cell to clone the repo and download data ---
 
 # --- Configuration ---
-ORIGINAL_DATA_DIR = "/content/Train"
-PROCESSED_DATA_DIR = "/content/Train_processed" # Directory for the high-speed data
+# Paths updated for the user's Kaggle environment structure
+ORIGINAL_DATA_DIR = "/kaggle/working/Train"
+PROCESSED_DATA_DIR = "/kaggle/working/Train_processed"
 KAGGLE_WORKING_DIR = "/kaggle/working/"
 N_TRIALS = 25
 TRIAL_EPOCHS = 25
