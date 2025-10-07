@@ -40,3 +40,57 @@ The original project provides a fantastic foundation. Our current approach build
 2.  **Advanced Data Augmentation:** We are using the `albumentations` library to apply a much wider and more powerful set of data augmentation techniques. This helps to make our models more robust and to prevent overfitting.
 
 In essence, we have taken the solid framework of the original project and upgraded it with state-of-the-art techniques to achieve a higher level of performance.
+
+ Here is a breakdown of the architecture and loss function used to create your submission_model.pth.
+
+  1. The Model: MultiScaleUNet
+
+
+  This is a custom-built segmentation model based on the famous U-Net architecture. Instead of just giving a single number for layers (which
+  can be misleading), here’s a structural overview:
+
+
+   * Overall Structure: It's a classic Encoder-Decoder design. The encoder progressively downsamples the image to capture broad, contextual
+     features, and the decoder progressively upsamples it back to the original resolution to create a pixel-perfect mask.
+
+
+   * Encoder Path: Consists of an initial convolution block followed by 4 down-sampling blocks. Each block uses MaxPool2d to shrink the image
+     and a DoubleConv module (two sets of Convolution -> BatchNorm -> ReLU).
+
+
+   * Decoder Path: Consists of 4 up-sampling blocks. Each block uses Upsample (bilinear interpolation) to enlarge the image, concatenates it
+     with the corresponding feature map from the encoder path (the "skip connection"), and passes it through a DoubleConv module.
+
+  Key Functions & Concepts:
+
+
+   * Multi-Scale Input: This is the most unique feature. Before the first layer, the input image is concatenated with a version of itself that
+     has been shrunk by 50% and then immediately enlarged back. This allows the model's first layer to see features at two different scales
+     simultaneously, helping it capture both fine details and broader context right from the start.
+
+   * Activation & Normalization: The standard functions used throughout the network are `ReLU` for activation and `BatchNorm2d` for
+     normalization after most convolutions. This is a classic and robust combination.
+
+
+   * SEBlock (Squeeze-and-Excitation Block): This is an attention mechanism used near the start of the model. In simple terms, this block
+     intelligently analyzes all the feature channels and learns which ones are more important. It then "turns up the volume" on the important
+     channels and "turns down the volume" on the less useful ones, forcing the model to focus on the most informative features.
+
+  2. The Loss Function: MixedLoss
+
+  To handle the challenge of the highly imbalanced dataset (very few glacier pixels), we used a powerful combination of two different loss
+  functions, weighted 50/50.
+
+
+   * Focal Loss: This loss is designed specifically for class imbalance. It reshapes the standard cross-entropy loss so that the model pays
+     less attention to easy, correctly classified examples (like vast areas of non-glacier rock) and focuses its training effort on the
+     "hard-to-classify" pixels right at the glacier boundaries.
+
+
+   * Tversky Loss: This loss is designed specifically for segmentation tasks. It directly optimizes a metric related to the Intersection over
+     Union (IoU) of the predicted mask and the true mask. It is particularly good at balancing the trade-off between false positives and false
+     negatives, which is crucial for getting clean segmentation results.
+
+
+  By combining these two, we get the best of both worlds: a model that focuses on the difficult boundary pixels while also trying to
+  maximize the overall quality and overlap of the final mask.

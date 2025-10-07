@@ -337,8 +337,8 @@ def objective(trial, data_dir, all_tile_ids, global_stats, trial_epochs):
     train_ids, val_ids = train_test_split(all_tile_ids, test_size=0.2, random_state=42)
     train_dataset = GlacierTileDataset(data_dir, train_ids, global_stats, augment=True)
     val_dataset = GlacierTileDataset(data_dir, val_ids, global_stats, augment=False)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True, drop_last=False)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True, drop_last=True)
 
     # --- Model, Loss, Optimizer ---
     model = MultiScaleUNet(n_channels=5, n_classes=1).to(device)
@@ -418,8 +418,8 @@ if __name__ == '__main__':
     train_ids, val_ids = train_test_split(all_tile_ids, test_size=0.2, random_state=42)
     final_train_dataset = GlacierTileDataset(DATA_DIR, train_ids, global_stats, augment=True)
     final_val_dataset = GlacierTileDataset(DATA_DIR, val_ids, global_stats, augment=False)
-    final_train_loader = DataLoader(final_train_dataset, batch_size=best_trial.params['batch_size'], shuffle=True, num_workers=0, pin_memory=True, drop_last=True)
-    final_val_loader = DataLoader(final_val_dataset, batch_size=best_trial.params['batch_size'], shuffle=False, num_workers=0, pin_memory=True, drop_last=False)
+    final_train_loader = DataLoader(final_train_dataset, batch_size=best_trial.params['batch_size'], shuffle=True, num_workers=2, pin_memory=True, drop_last=True)
+    final_val_loader = DataLoader(final_val_dataset, batch_size=best_trial.params['batch_size'], shuffle=False, num_workers=2, pin_memory=True, drop_last=True)
 
     # Model and optimizer
     device = "cuda" if torch.cuda.is_available() else "cpu"

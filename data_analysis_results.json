@@ -1,0 +1,10 @@
+{
+  "total_tiles": 25,
+  "valid_tiles": 10,
+  "glacier_ratio": 0.33376388549804686,
+  "ndsi_separation": 0.17094845334211112,
+  "can_cross_70": true,
+  "critical_issues": [
+    "small_dataset"
+  ]
+}

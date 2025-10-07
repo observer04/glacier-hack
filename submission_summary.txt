@@ -1,0 +1,89 @@
+# Summary of Submission Debugging Session
+
+This document summarizes the process of debugging the glacier segmentation model submission to the competition platform.
+
+## 1. Initial Goal
+
+The primary objective was to run a sanity check on a local `solution.py` script and then successfully submit it to the competition platform.
+
+## 2. Local Sanity Check and Visualization
+
+We first debugged a local `sanity_check.py` script to verify the model's output, which involved:
+* Fixing hardcoded file paths.
+* Handling inconsistent filenames in the training data.
+* Adding a visualization step to compare input images with output masks.
+* Correcting an "inverted mask" issue by ensuring the prediction threshold logic was `> 0.5`.
+
+## 3. Platform Submission Debugging
+
+Submitting to the platform revealed that the official `instruction.txt` was misleading and did not reflect the platform's actual evaluation process. We diagnosed and fixed a series of errors by observing the platform's error logs, which was the only reliable source of truth.
+
+*   **Error 1: `model.pth not found`**
+    *   **Insight:** The platform was not running `python solution.py` as instructed. It was importing the script as a module and calling the `maskgeration` function directly.
+
+*   **Error 2: `FileExistsError: [Errno 17] File exists: '/work/model.pth'`**
+    *   **Insight:** The platform was calling `maskgeration(imagepath, model_path)`, passing the model file path as the second argument, which the function expected to be the output directory.
+
+*   **Error 3: `HTTP Error: 504 (Gateway Timeout)`**
+    *   **Insight:** The script was too slow due to Test-Time Augmentation (TTA), which tripled the prediction time.
+    *   **Solution:** Disabled TTA to ensure the script could complete within the platform's time limit.
+
+*   **Error 4: `AttributeError: 'list' object has no attribute 'items'`**
+    *   **Insight:** The platform expected the `maskgeration` function to return a **dictionary**, not a list of filenames.
+
+*   **Error 5: `ValueError: No masks generated`**
+    *   **Insight:** The function used to create a `tile_id` was too broad (e.g., `img001`), causing the platform to create corrupted filenames (`imgimg001.tif`).
+    *   **Solution:** Changed the `tile_id` generation to extract only the numeric part of the filename (e.g., `001`).
+
+*   **Error 6: `AttributeError: 'str' object has no attribute 'max'`**
+    *   **Insight:** The platform expected the returned dictionary to contain the raw mask data (as NumPy arrays with values of 0 or 1), not file paths.
+    *   **Solution:** Changed the return dictionary to be `{tile_id: numpy_array}`.
+
+## 4. Final `solution.py` for Submission
+
+The final, successful version of `solution.py` contains several specific workarounds tailored to the platform's quirky behavior:
+
+1.  **Function Signature:** It uses the documented `def maskgeration(imagepath, out_dir):` signature.
+2.  **Argument Handling:** Inside the function, it correctly interprets the `out_dir` argument as the `model_path`.
+3.  **File Saving:** The function does **not** save any files itself. This is handled by the platform based on the returned dictionary.
+4.  **Optimization:** Test-Time Augmentation (TTA) is disabled.
+5.  **Return Value:** The function returns a dictionary mapping each `tile_id` to the corresponding **raw mask data** as a NumPy array with values of 0 and 1.
+6.  **Tile ID Generation:** It uses a regular expression to extract only the **numeric part** of the filename as the `tile_id`.
+
+---
+
+## Session: Transfer Learning Experiments
+
+**Objective:** Improve MCC score from ~0.6 to >0.7 after previous methods plateaued.
+
+### Phase 1: Debugging a Custom Attention U-Net (`kaggle_v2.py`)
+
+Our initial goal was to run a more advanced custom U-Net, but this was plagued by a series of deep and frustrating bugs that I repeatedly failed to fix correctly.
+
+*   **Initial State:** The script failed immediately due to a `DataLoader` error (batch size was larger than the dataset).
+*   **The Bug Loop:** After fixing the data loader, we entered a loop of `RuntimeError`s caused by channel dimension mismatches in the U-Net's decoder. My attempts to patch the model were flawed, leading to multiple rounds of the same error. This was a significant failure in my code generation and verification process.
+*   **Other Bugs Fixed:** Along the way, we also fixed a `FileNotFoundError` (regression in data loading), a `KeyError` (backwards compatibility for stats file), and multiple API usage errors (`GradScaler`, `DataParallel`).
+
+### Phase 2: Experimentation with the Custom U-Net
+
+Once the custom model was finally working, we ran a series of methodical experiments:
+
+1.  **Baseline Run:** The fixed model achieved a peak MCC of **~0.64**. The training was unstable.
+2.  **Wider Model Run:** We hypothesized the model was underfitting and increased its width. This produced a healthier, decreasing training loss, but the validation MCC **dropped to ~0.61**. This indicated the wider model was too complex for the small dataset.
+3.  **Balanced Model Run:** We reduced the model size back to its original width but kept the improved training recipe. The MCC was **~0.62**. 
+
+**Key Insight:** These experiments proved that the custom U-Net architecture, even with an advanced training recipe, had hit a hard performance ceiling around 0.61-0.64 MCC.
+
+### Phase 3: Pivot to Transfer Learning (`kaggle_v3.py`)
+
+Based on the insight above, we pivoted to a more powerful, standard approach for this type of problem.
+
+*   **Strategy:** Implement a U-Net with a pre-trained **EfficientNet-B5** backbone, using weights from ImageNet.
+*   **Implementation:**
+    *   Manually constructed the new architecture using `torchvision.models.efficientnet_b5`.
+    *   The encoder's input layer was modified to accept 5-channel satellite data.
+    *   A new decoder was written to match the specific channel and resolution outputs of the EfficientNet encoder.
+    *   The script includes 5-fold cross-validation, differential learning rates, and post-processing to remove noisy predictions.
+*   **Debugging:** This complex implementation also had bugs, including a final, persistent `RuntimeError` due to channel mismatches. After multiple failed patches, the issue was resolved by rewriting the decoder in a more explicit, verbose style to guarantee correct channel arithmetic.
+
+**Current Status:** A complete, runnable `kaggle_v3.py` script has been created. It represents our most powerful and methodologically sound attempt to break the 0.7 MCC target. We are currently waiting for the results of its 5-fold cross-validation run.
